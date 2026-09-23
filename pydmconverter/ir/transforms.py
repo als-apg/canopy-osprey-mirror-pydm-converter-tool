@@ -131,6 +131,11 @@ def first_of(value: Any) -> Any:
     return value
 
 
+# Display-file suffixes of every front-end (PyDM, EDM, MEDM, Phoebus bob, BOY
+# opi), matched case-insensitively. No existence check: the corpus test owns it.
+_SCREEN_SOURCE_EXTENSIONS = (".ui", ".edl", ".adl", ".bob", ".opi")
+
+
 def screen_ref(value: Any) -> Any:
     """A PyDM screen reference (``filename``/``filenames``) -> the converted
     ``.screen.json`` artifact.
@@ -145,10 +150,11 @@ def screen_ref(value: Any) -> Any:
     if value is DROP or not isinstance(value, str) or not value.strip():
         return DROP if value is DROP else value
     ref = value.strip().replace("\\", "/")
-    if ref.endswith(".screen.json"):
+    lowered = ref.lower()
+    if lowered.endswith(".screen.json"):
         return ref
-    for ext in (".ui", ".edl"):
-        if ref.endswith(ext):
+    for ext in _SCREEN_SOURCE_EXTENSIONS:
+        if lowered.endswith(ext):
             return ref[: -len(ext)] + ".screen.json"
     # Extensionless targets get the extension appended; macro refs can't be
     # rewritten, so leave them.
