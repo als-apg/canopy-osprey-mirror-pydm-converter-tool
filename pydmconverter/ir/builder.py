@@ -62,11 +62,16 @@ class IRBuilder:
         top_level: list[SourceNode],
         macros: list[MacroDeclaration] | None = None,
         background: str | None = None,
+        macro_defaults: dict[str, str] | None = None,
     ) -> ScreenIR:
         """Assemble a screen: an ``absolute-canvas`` root wrapping the top-level nodes.
 
         If ``macros`` is not supplied, declare every ``${VAR}`` referenced in props
         (default ``""``), so the screen is self-consistent (macros design M2/M9).
+        ``macro_defaults`` (e.g. a display's ``<macros>`` block) then overlays its
+        values onto those declarations and appends any macro it names that nothing
+        references. Defaults are stored verbatim, even when they contain ``${OTHER}``
+        (the runtime resolves them). It is ignored when ``macros`` is supplied.
         """
         width, height = size
         # Allocate the root id before children so the canvas stays w-001.
@@ -92,7 +97,12 @@ class IRBuilder:
             geometry=Geometry(x=0, y=0, width=width, height=height),
             children=children,
         )
-        declared = macros if macros is not None else self._collect_macros(root)
+        if macros is not None:
+            declared = macros
+        else:
+            declared = self._collect_macros(root)
+            if macro_defaults:
+                declared = self._overlay_macro_defaults(declared, macro_defaults)
         return ScreenIR(
             id=screen_id,
             kind="screen",
@@ -120,6 +130,7 @@ class IRBuilder:
             rules=self._build_rules(node.rules),
             children=[self._build_node(child) for child in node.children],
             warnings=list(node.warnings),
+            meta=node.meta,
         )
 
     def _map_props(self, qt_props: dict[str, Any], definition: WidgetDefinition) -> dict[str, Any]:
@@ -164,6 +175,7 @@ class IRBuilder:
             rules=self._build_rules(node.rules),
             children=[self._build_node(child) for child in node.children],
             warnings=warnings,
+            meta=node.meta,
         )
 
     def _build_rules(self, specs: list[RuleSpec]) -> list[Rule]:
@@ -218,6 +230,19 @@ class IRBuilder:
     def _geometry(geom: tuple[Number, Number, Number, Number]) -> Geometry:
         x, y, width, height = geom
         return Geometry(x=x, y=y, width=width, height=height)
+
+    @staticmethod
+    def _overlay_macro_defaults(collected: list[MacroDeclaration], defaults: dict[str, str]) -> list[MacroDeclaration]:
+        """Apply ``defaults`` to ``collected`` (order kept), then append the
+        unreferenced names in ``defaults`` insertion order."""
+        referenced = {m.name for m in collected}
+        overlaid = [
+            MacroDeclaration(name=m.name, default=defaults[m.name]) if m.name in defaults else m for m in collected
+        ]
+        overlaid.extend(
+            MacroDeclaration(name=name, default=value) for name, value in defaults.items() if name not in referenced
+        )
+        return overlaid
 
     def _collect_macros(self, root: WidgetNode) -> list[MacroDeclaration]:
         """Declare every ``${VAR}`` referenced in any string prop, default ``""``.

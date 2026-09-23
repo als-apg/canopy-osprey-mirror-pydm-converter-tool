@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydmconverter.ir.model import Number
+from pydmconverter.ir.model import NodeMeta, Number
 
 
 @dataclass
@@ -63,6 +63,9 @@ class SourceNode:
         Original source props, surfaced verbatim on ``unknown-widget`` nodes.
     warnings:
         Convert-time notes to attach to the resulting node (D11).
+    meta:
+        Source metadata (e.g. an author comment) carried onto the IR node's
+        ``meta`` unchanged, on both the mapped and the ``unknown-widget`` path.
     """
 
     qt_class: str | None
@@ -74,6 +77,7 @@ class SourceNode:
     raw_class: str | None = None
     raw_props: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    meta: NodeMeta | None = None
 
     @property
     def original_class(self) -> str | None:
