@@ -1,9 +1,14 @@
+import json
+import sys
+from pathlib import Path
+
 import pytest
 from unittest.mock import patch
 
 from pydmconverter.__main__ import (
     copy_img_files,
     convert_files_in_folder,
+    main,
     run,
 )
 
@@ -281,3 +286,31 @@ class TestRun:
 
         args = mock_convert_folder.call_args[0]
         assert args[2] == ".edl"
+
+
+BOB_FIXTURES = Path(__file__).parent / "bob" / "fixtures"
+
+
+class TestReactTargetBob:
+    """--target react accepts Phoebus .bob inputs."""
+
+    def test_run_react_bob_writes_screen_json(self, tmp_path):
+        src = tmp_path / "x.bob"
+        src.write_bytes((BOB_FIXTURES / "defaults.bob").read_bytes())
+        run(str(src), str(tmp_path / "x"), target="react", override=True)
+        out = tmp_path / "x.screen.json"
+        assert out.is_file()
+        assert json.loads(out.read_text(encoding="utf-8"))["kind"] == "screen"
+
+    def test_main_color_def_option(self, tmp_path, monkeypatch):
+        src = tmp_path / "x.bob"
+        src.write_bytes((BOB_FIXTURES / "color_def.bob").read_bytes())
+        color_def = BOB_FIXTURES / "color.def"
+        argv = ["pydmconverter", str(src), str(tmp_path / "x"), "--target", "react", "--color-def", str(color_def)]
+        monkeypatch.setattr(sys, "argv", argv)
+        from pydmconverter import react
+
+        with patch("pydmconverter.react.convert_file", wraps=react.convert_file) as spy:
+            main()
+        assert spy.call_args.kwargs["color_def_path"] == str(color_def)
+        assert (tmp_path / "x.screen.json").is_file()

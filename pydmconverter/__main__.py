@@ -39,9 +39,10 @@ def run(
     calc_list=None,
     target="pydm",
     out_format="json",
+    color_def=None,
 ):
     if target == "react":
-        run_react(input_file, output_file, override, site=site, calc_list=calc_list)
+        run_react(input_file, output_file, override, site=site, calc_list=calc_list, color_def=color_def)
         return
 
     input_path: Path = Path(input_file)
@@ -75,19 +76,24 @@ def run(
             print(f"Failed files: {', '.join(map(lambda path: str(path), files_failed))}")
 
 
-def run_react(input_file, output_file, override, site=None, calc_list=None) -> None:
-    """Convert .edl/.ui to Canopy Screen IR JSON (the --target react path)."""
+def run_react(input_file, output_file, override, site=None, calc_list=None, color_def=None) -> None:
+    """Convert .edl/.ui/.bob to Canopy Screen IR JSON (the --target react path).
+
+    ``color_def`` is a Phoebus ``color.def`` applied to ``.bob`` inputs only.
+    """
     from pydmconverter import react
 
     input_path = Path(input_file)
     output_path = Path(output_file)
     if input_path.is_file():
-        out = react.convert_file(input_path, output_path, override=override, calc_list_path=calc_list, site=site)
+        out = react.convert_file(
+            input_path, output_path, override=override, calc_list_path=calc_list, site=site, color_def_path=color_def
+        )
         print(f"Converted {input_path} -> {out}")
     else:
         output_path.mkdir(parents=True, exist_ok=True)
         found, failed = react.convert_folder(
-            input_path, output_path, override=override, calc_list_path=calc_list, site=site
+            input_path, output_path, override=override, calc_list_path=calc_list, site=site, color_def_path=color_def
         )
         if found == 0:
             print(f"No {' or '.join(react.SUPPORTED_SUFFIXES)} files found in {input_path}")
@@ -124,6 +130,7 @@ def run_cli(args: argparse.Namespace) -> None:
         calc_list=calc_list,
         target=args.target,
         out_format=args.format,
+        color_def=args.color_def,
     )
 
 
@@ -291,6 +298,12 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to an EDM calc.list file used to resolve named CALC PVs",
+    )
+    parser.add_argument(
+        "--color-def",
+        type=str,
+        default=None,
+        help="Path to a Phoebus color.def used to resolve named colors in .bob inputs (--target react only)",
     )
     parser.add_argument(
         "--target",
