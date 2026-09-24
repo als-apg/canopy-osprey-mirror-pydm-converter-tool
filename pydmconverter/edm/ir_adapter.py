@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from pydmconverter.edm.edm_qt import (
     EDM_PRIMARY_CHANNEL_ORDER,
@@ -380,7 +381,10 @@ def _fixup_line(obj: EDMObject, qt_props: dict[str, Any], warnings: list[str]) -
     qt_props["arrowStartPoint"] = arrows in ("from", "both")
     qt_props["arrowEndPoint"] = arrows in ("to", "both")
 
-    if obj.properties.get("fill") or obj.properties.get("closePolygon"):
+    # Read both keys (no short-circuit): each one decides the closed shape, so
+    # neither is a dropped prop when the other is also set.
+    fill, close_polygon = obj.properties.get("fill"), obj.properties.get("closePolygon")
+    if fill or close_polygon:
         qt_props["closePolygon"] = True
 
     return geometry_override
@@ -691,7 +695,67 @@ _CLASS_FIXUPS.update(
 )
 
 
+class _ReadTrackingProps(dict):
+    """A dict that remembers which keys were looked up (``get``, ``[]``, ``in``).
+
+    Iteration (``items()``, ``dict(...)``) is not a read: the generic mapping loop
+    walks every key, and only :data:`EDM_TO_QT_PROP` decides whether it is used.
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__(data)
+        self.read: set[str] = set()
+
+    def __getitem__(self, key: str) -> Any:
+        self.read.add(key)
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        self.read.add(key)
+        return super().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        self.read.add(key)  # type: ignore[arg-type]
+        return super().__contains__(key)
+
+
+@contextmanager
+def _tracking_reads(obj: EDMObject) -> Iterator[_ReadTrackingProps]:
+    """Swap ``obj.properties`` for a read-tracking view for the duration of the block.
+
+    Re-entrant: an already-tracked object keeps its tracker, so an outer scope sees
+    the reads of every nested call. The original dict is always restored.
+    """
+    if isinstance(obj.properties, _ReadTrackingProps):
+        yield obj.properties
+        return
+    original = obj.properties
+    tracked = _ReadTrackingProps(original)
+    obj.properties = tracked
+    try:
+        yield tracked
+    finally:
+        obj.properties = original
+
+
 def _object_to_source(obj: EDMObject, colors: dict[str, Any] | None = None) -> SourceNode:
+    """Normalize one EDM object, recording the props it silently drops.
+
+    Every ``obj.properties`` lookup during the call (class resolution, the mapping
+    loop, channel attrs, alarm/pip rules, class fixups) is tracked; a key that is
+    neither in :data:`EDM_TO_QT_PROP` nor ever read is a loss and lands in
+    ``dropped_props``. Unknown widgets record nothing — they keep every raw prop.
+    Callers that read further keys (visibility) must enter :func:`_tracking_reads`
+    around this call so those reads count too.
+    """
+    with _tracking_reads(obj) as tracked:
+        node = _convert_object(obj, colors)
+        if node.qt_class is not None:
+            node.dropped_props = [key for key in tracked if key not in EDM_TO_QT_PROP and key not in tracked.read]
+    return node
+
+
+def _convert_object(obj: EDMObject, colors: dict[str, Any] | None) -> SourceNode:
     qt_class = resolve_qt_class(obj.name.lower(), obj.properties)
     qt_props: dict[str, Any] = {}
     warnings: list[str] = []
@@ -756,12 +820,10 @@ def _symbol_state_vis(group: EDMGroup) -> VisTuple | None:
     props = getattr(group, "properties", None) or {}
     if "symbolMin" not in props or "symbolMax" not in props:
         return None
-    channel = None
-    for sub_object in group.objects:
-        sub_props = getattr(sub_object, "properties", None) or {}
-        if sub_props.get("symbolChannel"):
-            channel = sub_props["symbolChannel"]
-            break
+    # Every leaf carries the same stamped channel; read each one (not just the
+    # first) so the key counts as consumed on every leaf, not as a dropped prop.
+    stamped = [(getattr(sub_object, "properties", None) or {}).get("symbolChannel") for sub_object in group.objects]
+    channel = next((value for value in stamped if value), None)
     if not channel:
         return None
     try:
@@ -837,6 +899,14 @@ def edm_group_to_source_nodes(
     nodes: list[SourceNode] = []
     for obj in group.objects:
         if isinstance(obj, EDMGroup):
+            with ExitStack() as leaves:
+                # A symbol-state group reads its leaves' stamped symbolChannel; track
+                # the leaves across that read and their own conversion so it counts.
+                for leaf in obj.objects:
+                    if isinstance(leaf, EDMObject):
+                        leaves.enter_context(_tracking_reads(leaf))
+                symbol_vis = _symbol_state_vis(obj)
+                children = edm_group_to_source_nodes(obj, colors=colors, skip_classes=skip_classes)
             group_node = SourceNode(
                 qt_class=None,
                 registry_id="group",
@@ -844,10 +914,9 @@ def edm_group_to_source_nodes(
                 geometry=(obj.x, obj.y, obj.width, obj.height),
                 raw_class="activeGroupClass",
                 raw_props=dict(obj.properties),
-                children=edm_group_to_source_nodes(obj, colors=colors, skip_classes=skip_classes),
+                children=children,
             )
             vis_tuples: list[VisTuple] = []
-            symbol_vis = _symbol_state_vis(obj)
             if symbol_vis is not None:
                 vis_tuples.append(symbol_vis)
             group_vis = _vis_tuple(obj.properties)
@@ -859,8 +928,10 @@ def edm_group_to_source_nodes(
         elif isinstance(obj, EDMObject):
             if obj.name.lower() in skip_classes:
                 continue
-            node = _object_to_source(obj, colors)
-            own_vis = _vis_tuple(obj.properties)
+            with _tracking_reads(obj):
+                # Visibility is read first so its keys count as used by the node.
+                own_vis = _vis_tuple(obj.properties)
+                node = _object_to_source(obj, colors)
             if own_vis is not None:
                 # Append: the node may already carry alarm-color rules.
                 node.rules.append(_visibility_rule_spec([own_vis]))

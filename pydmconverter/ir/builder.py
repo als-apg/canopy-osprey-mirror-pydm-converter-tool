@@ -131,7 +131,17 @@ class IRBuilder:
             children=[self._build_node(child) for child in node.children],
             warnings=list(node.warnings),
             meta=node.meta,
+            dropped_props=self._dropped_props(node, definition),
         )
+
+    @staticmethod
+    def _dropped_props(node: SourceNode, definition: WidgetDefinition) -> list[str]:
+        """Front-end drops, then the Qt props ``_map_props`` discards (no ``qtPropMap`` entry)."""
+        dropped = list(node.dropped_props)
+        for qt_prop in node.qt_props:
+            if qt_prop not in definition.qt_prop_map and qt_prop not in dropped:
+                dropped.append(qt_prop)
+        return dropped
 
     def _map_props(self, qt_props: dict[str, Any], definition: WidgetDefinition) -> dict[str, Any]:
         """Translate Qt props to IR props via the widget's ``qtPropMap`` (the allowlist).
@@ -176,6 +186,7 @@ class IRBuilder:
             children=[self._build_node(child) for child in node.children],
             warnings=warnings,
             meta=node.meta,
+            dropped_props=list(node.dropped_props),
         )
 
     def _build_rules(self, specs: list[RuleSpec]) -> list[Rule]:

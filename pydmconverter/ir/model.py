@@ -150,6 +150,10 @@ class WidgetNode(IRModel):
     # that belongs with a specific node). Screen-level diagnostics travel
     # out-of-band, not in the IR (D12).
     warnings: list[str] = Field(default_factory=list)
+    # Source props the conversion discarded: front-end drops (no mapping, never
+    # read) plus builder drops (no qtPropMap entry). Diagnostic only — excluded
+    # from every dump, so it never reaches the wire or a golden.
+    dropped_props: list[str] = Field(default_factory=list, exclude=True)
 
 
 class ScreenIR(IRModel):

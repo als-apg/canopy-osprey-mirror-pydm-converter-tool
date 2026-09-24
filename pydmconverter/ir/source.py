@@ -66,6 +66,10 @@ class SourceNode:
     meta:
         Source metadata (e.g. an author comment) carried onto the IR node's
         ``meta`` unchanged, on both the mapped and the ``unknown-widget`` path.
+    dropped_props:
+        Source prop names the front-end discarded (neither mapped nor used), in
+        source order. Carried onto the IR node's ``dropped_props`` (never emitted)
+        so a conversion loss is visible instead of silent.
     """
 
     qt_class: str | None
@@ -78,6 +82,7 @@ class SourceNode:
     raw_props: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     meta: NodeMeta | None = None
+    dropped_props: list[str] = field(default_factory=list)
 
     @property
     def original_class(self) -> str | None:
