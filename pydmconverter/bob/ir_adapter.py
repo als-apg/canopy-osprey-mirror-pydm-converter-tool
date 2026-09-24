@@ -101,6 +101,9 @@ _STRUCTURAL_PROPS = frozenset(
         "arrows",
     }
 )
+# (widget type, prop) pairs the prop table leaves unmapped because another module reads
+# them: ``groups.group_style`` consumes a group's ``style``. Not recorded as dropped.
+_BOB_CONSUMED = frozenset({("group", "style")})
 _SHAPE_TYPES = frozenset({"rectangle", "ellipse", "polygon"})
 _POINT_TYPES = frozenset({"polygon", "polyline"})
 # Kinds for props the rule-target table does not name.
@@ -252,6 +255,7 @@ class _WidgetLowering:
         self.formula_ctx = _FormulaCtx(builder=state.builder, warnings=self.warnings)
         self.declined: list[str] = []
         self.qt_props: dict[str, Any] = {}
+        self.dropped_props: list[str] = []
         self.rules: list[RuleSpec] = []
         self.targets: list[tuple[str, str, str]] = []  # (key, formula name, target pv)
         self.unknown = False
@@ -328,6 +332,7 @@ class _WidgetLowering:
             raw_props=_raw_props(widget) if self.unknown else {},
             warnings=self.warnings,
             meta=meta,
+            dropped_props=self.dropped_props,
         )
 
     # -- props ----------------------------------------------------------------
@@ -341,6 +346,8 @@ class _WidgetLowering:
                 continue
             qt_prop = qt_prop_for(wtype, prop)
             if qt_prop is None:
+                if (wtype, prop) not in _BOB_CONSUMED:
+                    self.dropped_props.append(prop)
                 continue
             kind = _EXTRA_KINDS.get(prop) or rule_coercion(prop)
             coerced = self.coerce(kind, value)
