@@ -45,7 +45,7 @@ BOB_TO_QT_CLASS: dict[str, tuple[str | None, str]] = {
     "ellipse": ("PyDMDrawingEllipse", "ellipse"),
     "polygon": ("PyDMDrawingIrregularPolygon", "polygon"),
     "polyline": ("PyDMDrawingPolyline", "line"),
-    "xyplot": ("PyDMWaveformPlot", "waveform-plot"),
+    "xyplot": ("PyDMScatterPlot", "xy-plot"),
     "group": ("QGroupBox", "group-box"),
     # secondary types with registry matches
     "combo": ("PyDMEnumComboBox", "pv-enum-combobox"),
@@ -88,8 +88,6 @@ GROUP_STYLE_TO_ID: dict[int, tuple[str | None, str]] = {
 }
 
 TABS_WARNING = "{widget}: Phoebus tabs need a registry qtPropMap for tabs[]"
-PICTURE_WARNING = "{widget}: image {file} not copied (asset copying out of scope)"
-BOOL_BUTTON_IMAGES_WARNING = "{widget}: on/off images not carried (asset copying out of scope)"
 
 # --------------------------------------------------------------------------
 # Prop table: Phoebus prop -> Qt prop (as used by the registry qtPropMaps).

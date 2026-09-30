@@ -81,9 +81,9 @@ def _warn(warnings: list[str] | None, message: str) -> None:
 
 
 def rgba_to_hex(rgba: tuple[int, ...]) -> str:
-    """``(r, g, b[, a])`` -> ``"#rrggbb"`` (alpha is dropped, components clamped)."""
-    r, g, b = (max(0, min(255, int(c))) for c in rgba[:3])
-    return f"#{r:02x}{g:02x}{b:02x}"
+    """``(r, g, b[, a])`` -> ``"#rrggbb"``, or ``"#rrggbbaa"`` when alpha < 255 (components clamped)."""
+    r, g, b, a = (max(0, min(255, int(c))) for c in (*rgba[:4], 255)[:4])
+    return f"#{r:02x}{g:02x}{b:02x}" if a == 255 else f"#{r:02x}{g:02x}{b:02x}{a:02x}"
 
 
 def _parse_rgba_list(text: str) -> RGBA | None:
@@ -158,7 +158,7 @@ def color_from_element(
     named: dict[str, RGBA] | None = None,
     warnings: list[str] | None = None,
 ) -> str | None:
-    """``<color>`` element (or a property element wrapping one) -> ``"#rrggbb"``.
+    """``<color>`` element (or a property element wrapping one) -> ``"#rrggbb[aa]"``.
 
     A named colour resolves through ``named`` (default: the built-ins), which wins
     over the RGB attributes saved alongside the name, as in Phoebus. An unknown

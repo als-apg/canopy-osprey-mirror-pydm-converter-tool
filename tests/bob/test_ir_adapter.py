@@ -117,7 +117,8 @@ def test_defaults_fixture_acceptance():
     assert nodes["line"]["props"]["arrowEnd"] is True
     assert nodes["line"]["props"]["arrowStart"] is False
     assert nodes["embedded-display"]["props"] == {"file": "embedded/_host.screen.json", "macros": {"HOST": "${P}HOST"}}
-    assert nodes["image-view"]["warnings"] == ["Picture: image logo.png not copied (asset copying out of scope)"]
+    assert nodes["image-view"].get("warnings", []) == []
+    assert nodes["image-view"]["props"]["src"] == "logo.png"
 
 
 def test_tabs_stay_unknown_with_warning():
@@ -138,17 +139,164 @@ def test_bool_button_modes_and_images():
     assert (inverted["props"]["pressValue"], inverted["props"]["releaseValue"]) == (0, 1)
     assert inverted["props"]["onLabel"] == "Open"
     assert inverted["props"]["offColor"] == "#ff0000"
-    assert images["warnings"] == ["Images: on/off images not carried (asset copying out of scope)"]
+    assert images.get("warnings", []) == []
+    assert (images["props"]["onImage"], images["props"]["offImage"]) == ("on.png", "off.png")
     assert bare.get("warnings", []) == []
 
 
 def test_xyplot_traces_and_axes():
     (plot,) = _children("xyplot")
-    assert plot["type"] == "waveform-plot"
+    assert plot["type"] == "xy-plot"
     assert plot["props"]["curves"] == [
-        {"name": "${BPM} orbit", "x_channel": "${BPM_X}", "y_channel": "${BPM_Y}", "color": "#0000ff", "lineWidth": 2}
+        {
+            "name": "${BPM} orbit",
+            "x_channel": "${BPM_X}",
+            "y_channel": "${BPM_Y}",
+            "color": "#0000ff",
+            "lineWidth": 2,
+            "traceType": "line",
+            "symbol": "none",
+            "symbolSize": 10,
+            "lineStyle": 1,
+            "yAxisName": "y0",
+        }
     ]
-    assert plot["props"]["yAxes"] == [{"name": "y0", "label": "mm"}, {"name": "y1", "label": "${UNIT}"}]
+    assert plot["props"]["showLegend"] is True
+    assert plot["props"]["xAxis"] == _XY_DEFAULT_AXIS | {"name": "x", "label": "X"}
+    assert plot["props"]["yAxes"] == [
+        _XY_DEFAULT_AXIS | {"name": "y0", "label": "mm"},
+        _XY_DEFAULT_AXIS | {"name": "y1", "label": "${UNIT}"},
+    ]
+
+
+_XY_DEFAULT_AXIS = {
+    "autoRange": False,
+    "minRange": 0,
+    "maxRange": 100,
+    "logMode": False,
+    "grid": False,
+    "visible": True,
+}
+
+
+def test_xyplot_scatter_explicit_fields():
+    (plot,) = _children("xyplot_scatter")
+    assert plot["type"] == "xy-plot"
+    props = plot["props"]
+    assert props["showLegend"] is False
+    assert props["curves"] == [
+        {
+            "x_channel": "${X}",
+            "y_channel": "${Y}",
+            "name": "",
+            "color": "#ff0000",
+            "symbol": "circle",
+            "symbolSize": 7,
+            "traceType": "none",
+            "lineWidth": 1,
+            "lineStyle": 1,
+            "yAxisName": "y0",
+        }
+    ]
+    explicit = {"autoRange": False, "logMode": False, "grid": True, "visible": True}
+    assert props["xAxis"] == explicit | {"name": "x", "label": "", "minRange": 10, "maxRange": -10}
+    assert props["yAxes"] == [explicit | {"name": "y0", "label": "", "minRange": -10, "maxRange": 10}]
+    assert plot.get("warnings", []) == []
+
+
+def _xy_display(body: str) -> bytes:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<display version="2.0.0"><name>D</name>'
+        f'<widget type="xyplot" version="2.0.0"><name>P</name>{body}</widget></display>'
+    ).encode()
+
+
+def _xy_props(body: str) -> dict:
+    return to_wire_dict(bob_bytes_to_ir(_xy_display(body)))["root"]["children"][0]["props"]
+
+
+def _xy_curves(*traces: str) -> list[dict]:
+    return _xy_props("<traces>" + "".join(f"<trace>{t}</trace>" for t in traces) + "</traces>")["curves"]
+
+
+@pytest.mark.parametrize(
+    ("trace", "expected"),
+    [
+        ("<name>$(traces[0].y_pv)</name><y_pv>LN:HSD1:In4:WF</y_pv>", "LN:HSD1:In4:WF"),
+        ("<y_pv>LN:HSD1:In4:WF</y_pv>", "LN:HSD1:In4:WF"),
+        ("<name></name><y_pv>LN:HSD1:In4:WF</y_pv>", ""),
+        ("<name>$(traces[0].x_pv)</name><x_pv>A:X</x_pv><y_pv>A:Y</y_pv>", "A:X"),
+        ("<name>$(P) orbit</name><y_pv>A:Y</y_pv>", "${P} orbit"),
+    ],
+)
+def test_curve_name_rule(trace, expected):
+    (curve,) = _xy_curves(trace)
+    assert curve["name"] == expected
+
+
+def test_curve_name_resolves_other_trace():
+    first, second = _xy_curves(
+        "<name>first</name><y_pv>A:1</y_pv>",
+        "<name>$(traces[0].name)</name><y_pv>A:2</y_pv>",
+    )
+    assert first["name"] == "first"
+    assert second["name"] == "first"
+
+
+@pytest.mark.parametrize(
+    ("trace", "expected"),
+    [
+        (
+            "",
+            {
+                "traceType": "line",
+                "symbol": "none",
+                "symbolSize": 10,
+                "lineWidth": 1,
+                "lineStyle": 1,
+                "yAxisName": "y0",
+            },
+        ),
+        ("<trace_type>0</trace_type>", {"traceType": "none"}),
+        ("<trace_type>2</trace_type>", {"traceType": "line"}),
+        ("<point_type>0</point_type>", {"symbol": "none"}),
+        ("<point_type>1</point_type>", {"symbol": "square"}),
+        ("<point_type>2</point_type>", {"symbol": "circle"}),
+        ("<point_type>3</point_type>", {"symbol": "diamond"}),
+        ("<point_type>4</point_type>", {"symbol": "x"}),
+        ("<point_type>5</point_type>", {"symbol": "triangle"}),
+        ("<point_size>4</point_size>", {"symbolSize": 4}),
+        ("<line_style>0</line_style>", {"lineStyle": 1}),
+        ("<line_style>1</line_style>", {"lineStyle": 2}),
+        ("<line_style>2</line_style>", {"lineStyle": 3}),
+        ("<line_style>3</line_style>", {"lineStyle": 4}),
+        ("<line_style>4</line_style>", {"lineStyle": 5}),
+        ("<axis>1</axis>", {"yAxisName": "y1"}),
+    ],
+)
+def test_curve_trace_fields(trace, expected):
+    (curve,) = _xy_curves("<name>n</name><y_pv>A:Y</y_pv>" + trace)
+    assert {key: curve.get(key) for key in expected} == expected
+
+
+def test_xyplot_without_axes_gets_default_axes_and_legend():
+    props = _xy_props("")
+    assert props["showLegend"] is True
+    assert props.get("curves", []) == []
+    assert props["xAxis"] == _XY_DEFAULT_AXIS | {"name": "x", "label": "X"}
+    assert props["yAxes"] == [_XY_DEFAULT_AXIS | {"name": "y0", "label": "Y"}]
+
+
+def test_xyplot_axis_title_macro_and_absent_title():
+    props = _xy_props(
+        "<x_axis><autoscale>true</autoscale><log_scale>true</log_scale></x_axis>"
+        "<y_axes><y_axis><title>$(U)</title></y_axis><y_axis><visible>false</visible></y_axis></y_axes>"
+    )
+    assert props["xAxis"] == _XY_DEFAULT_AXIS | {"name": "x", "label": "X", "autoRange": True, "logMode": True}
+    assert props["yAxes"] == [
+        _XY_DEFAULT_AXIS | {"name": "y0", "label": "${U}"},
+        _XY_DEFAULT_AXIS | {"name": "y1", "label": "Y", "visible": False},
+    ]
 
 
 def test_groups_by_style():
@@ -410,3 +558,22 @@ def test_every_pv_is_emitted_clean():
         text = to_json(_convert(name))
         assert '"pv": "=' not in text, name
         assert "<V" not in text, name
+
+
+def test_transparent_buttons_carry_transparent_prop():
+    clear, solid, clear_bool = _children("action_button_transparent")
+    assert clear["type"] == "regular-button"
+    assert clear["props"]["transparent"] is True
+    assert clear["props"]["label"] == "Go"
+    assert clear.get("warnings", []) == []
+    assert "transparent" not in solid["props"]
+    assert clear_bool["type"] == "pv-button"
+    assert clear_bool["props"]["transparent"] is True
+    assert clear_bool["props"]["pv"] == "SR:B0"
+
+
+def test_bool_button_images_normalise_macros():
+    clear_bool = _children("action_button_transparent")[2]
+    assert clear_bool["props"]["onImage"] == "${IMG}/on.png"
+    assert clear_bool["props"]["offImage"] == "${IMG}/off.png"
+    assert clear_bool.get("warnings", []) == []

@@ -58,7 +58,7 @@ def test_action_button_tooltip_and_border_alarm_sensitive_are_recorded():
     assert "border_alarm_sensitive" in node.dropped_props
 
 
-def test_xyplot_show_legend_and_x_axis_are_recorded():
+def test_xyplot_show_legend_and_x_axis_are_consumed_not_dropped():
     node = _only(
         _display(
             '<widget type="xyplot" version="2.0.0"><name>P</name><title>T</title>'
@@ -66,9 +66,21 @@ def test_xyplot_show_legend_and_x_axis_are_recorded():
             "<x_axis><title>t</title><autoscale>true</autoscale></x_axis></widget>"
         )
     )
-    assert "show_legend" in node.dropped_props
-    assert "x_axis" in node.dropped_props
+    assert "show_legend" not in node.dropped_props
+    assert "x_axis" not in node.dropped_props
     assert "title" not in node.dropped_props
+
+
+def test_xyplot_uncarried_sub_elements_are_not_recorded():
+    node = _only(
+        _display(
+            '<widget type="xyplot" version="2.0.0"><name>P</name>'
+            '<x_axis><title>t</title><title_font><font></font></title_font><color><color red="1" green="2" blue="3"/></color></x_axis>'
+            "<y_axes><y_axis><title>y</title><on_right>true</on_right></y_axis></y_axes>"
+            "<traces><trace><name>n</name><y_pv>A:B</y_pv><err_pv>A:E</err_pv></trace></traces></widget>"
+        )
+    )
+    assert node.dropped_props == []
 
 
 def test_group_style_is_consumed_not_dropped():

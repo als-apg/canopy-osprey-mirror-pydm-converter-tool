@@ -81,6 +81,21 @@ def test_color_from_rgb_attributes():
     assert color_from_element(_xml('<color red="18" green="52" blue="86" alpha="255"/>')) == "#123456"
 
 
+def test_color_from_rgb_attributes_keeps_partial_alpha():
+    assert color_from_element(_xml('<color red="18" green="52" blue="86" alpha="128"/>')) == "#12345680"
+
+
+def test_color_from_rgb_attributes_keeps_zero_alpha():
+    assert color_from_element(_xml('<color red="18" green="52" blue="86" alpha="0"/>')) == "#12345600"
+
+
+def test_rgba_to_hex_alpha():
+    assert coercion.rgba_to_hex((18, 52, 86)) == "#123456"
+    assert coercion.rgba_to_hex((18, 52, 86, 255)) == "#123456"
+    assert coercion.rgba_to_hex((18, 52, 86, 128)) == "#12345680"
+    assert coercion.rgba_to_hex((18, 52, 86, -5)) == "#12345600"
+
+
 def test_color_from_property_wrapper_element():
     elem = _xml('<foreground_color><color red="255" green="0" blue="0"/></foreground_color>')
     assert color_from_element(elem) == "#ff0000"

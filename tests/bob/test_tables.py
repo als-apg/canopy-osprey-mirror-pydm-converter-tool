@@ -102,7 +102,7 @@ def test_class_table_covers_milestones_and_excludes_tabs():
         ("ellipse", "ellipse"),
         ("polygon", "polygon"),
         ("polyline", "line"),
-        ("xyplot", "waveform-plot"),
+        ("xyplot", "xy-plot"),
         ("group", "group-box"),
         ("picture", "image-view"),
     ],

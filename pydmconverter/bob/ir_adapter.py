@@ -23,6 +23,7 @@ it concerns.
 from __future__ import annotations
 
 import dataclasses
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,11 +32,9 @@ from typing import Any
 from pydmconverter.bob.actions import ActionContext, action_button_label, lower_actions
 from pydmconverter.bob.bob_qt import (
     BOB_DEFAULTS,
-    BOOL_BUTTON_IMAGES_WARNING,
     BOOL_BUTTON_MODE,
     DISPLAY_BACKGROUND_DEFAULT,
     DISPLAY_DEFAULT_SIZE,
-    PICTURE_WARNING,
     READBACK_COPY,
     TABS_WARNING,
     TRANSPARENT_BG_RULE_TYPES,
@@ -102,9 +101,17 @@ _STRUCTURAL_PROPS = frozenset(
     }
 )
 # (widget type, prop) pairs the prop table leaves unmapped because another module reads
-# them: ``groups.group_style`` consumes a group's ``style``. Not recorded as dropped.
-_BOB_CONSUMED = frozenset({("group", "style")})
+# them: ``groups.group_style`` consumes a group's ``style``; ``_xyplot`` consumes an
+# xyplot's ``x_axis`` and ``show_legend``. Not recorded as dropped.
+_BOB_CONSUMED = frozenset({("group", "style"), ("xyplot", "x_axis"), ("xyplot", "show_legend")})
+# Phoebus trace ``point_type`` -> xy-plot curve ``symbol``.
+_XY_SYMBOL = {0: "none", 1: "square", 2: "circle", 3: "diamond", 4: "x", 5: "triangle"}
+# Phoebus trace ``line_style`` -> Qt::PenStyle (1 solid, 2 dash, 3 dot, 4 dashdot, 5 dashdotdot).
+_XY_PEN_STYLE = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5}
+# Phoebus's default trace name ``$(traces[N].y_pv)``: a property path no macro regex expands.
+_XY_TRACE_REF = re.compile(r"\$\(traces\[(\d+)\]\.(x_pv|y_pv|name)\)")
 _SHAPE_TYPES = frozenset({"rectangle", "ellipse", "polygon"})
+_BUTTON_TYPES = frozenset({"action_button", "bool_button"})
 _POINT_TYPES = frozenset({"polygon", "polyline"})
 # Kinds for props the rule-target table does not name.
 _EXTRA_KINDS = {"show_units": "bool", "numBits": "number", "startBit": "number"}
@@ -370,7 +377,6 @@ class _WidgetLowering:
             self._embedded(props)
         elif wtype == "picture":
             file = prop_text(props.get("file")).strip()
-            self.warn(PICTURE_WARNING.format(widget=self.name, file=file))
             if file:
                 self.qt_props["filename"] = normalize_macro_syntax(file)
         elif wtype == "xyplot":
@@ -418,6 +424,9 @@ class _WidgetLowering:
             self.qt_props["brushFill"] = not is_true(props.get("transparent"), self.rule_ctx, self.name)
         elif wtype in TRANSPARENT_BG_RULE_TYPES and is_true(props.get("transparent"), self.rule_ctx, self.name):
             self.qt_props.pop("backgroundColor", None)
+        elif wtype in _BUTTON_TYPES and is_true(props.get("transparent"), self.rule_ctx, self.name):
+            # Ruling 7: no painted chrome; label and press/release handlers stay.
+            self.qt_props["flat"] = True
 
     def _format(self, props: dict[str, Any]) -> None:
         if "format" not in props or qt_prop_for(self.widget.type, "format") is None:
@@ -437,8 +446,10 @@ class _WidgetLowering:
     def _bool_button(self, props: dict[str, Any]) -> None:
         mode = _int(props.get("mode"), 0)
         self.qt_props.update(BOOL_BUTTON_MODE.get(mode, BOOL_BUTTON_MODE[0]))
-        if prop_text(props.get("on_image")).strip() or prop_text(props.get("off_image")).strip():
-            self.warn(BOOL_BUTTON_IMAGES_WARNING.format(widget=self.name))
+        for prop, qt_prop in (("on_image", "onImage"), ("off_image", "offImage")):
+            image = prop_text(props.get(prop)).strip()
+            if image:
+                self.qt_props[qt_prop] = normalize_macro_syntax(image)
 
     def _embedded(self, props: dict[str, Any]) -> None:
         file = prop_text(props.get("file")).strip()
@@ -449,23 +460,46 @@ class _WidgetLowering:
 
     def _xyplot(self, props: dict[str, Any]) -> None:
         traces = props.get("traces")
+        trace_list = traces.findall("trace") if isinstance(traces, ET.Element) else []
         curves: list[dict[str, Any]] = []
-        if isinstance(traces, ET.Element):
-            for index, trace in enumerate(traces.findall("trace")):
-                curve = self._curve(trace, index)
-                if curve is not None:
-                    curves.append(curve)
+        for index, trace in enumerate(trace_list):
+            curve = self._curve(trace, index, trace_list)
+            if curve is not None:
+                curves.append(curve)
         self.qt_props["curves"] = curves
+        x_axis = props.get("x_axis")
+        self.qt_props["xAxis"] = self._axis(x_axis if isinstance(x_axis, ET.Element) else None, "x", "X")
         axes = props.get("y_axes")
-        y_axes: list[dict[str, Any]] = []
-        if isinstance(axes, ET.Element):
-            for index, axis in enumerate(axes.findall("y_axis")):
-                title = normalize_macro_syntax((axis.findtext("title") or "").strip())
-                y_axes.append({"name": f"y{index}", "label": title})
-        self.qt_props["yAxes"] = y_axes
+        y_axis_list = axes.findall("y_axis") if isinstance(axes, ET.Element) else []
+        self.qt_props["yAxes"] = [self._axis(axis, f"y{i}", "Y") for i, axis in enumerate(y_axis_list)] or [
+            self._axis(None, "y0", "Y")
+        ]
+        legend = props.get("show_legend")
+        # Phoebus shows the legend by default and its writer omits the default value.
+        self.qt_props["showLegend"] = is_true(legend, self.rule_ctx, self.name) if legend is not None else True
 
-    def _curve(self, trace: ET.Element, index: int) -> dict[str, Any] | None:
-        name = normalize_macro_syntax((trace.findtext("name") or "").strip())
+    def _axis(self, axis: ET.Element | None, name: str, default_label: str) -> dict[str, Any]:
+        """One Phoebus axis -> an xy-plot axis; absent fields take Phoebus's defaults."""
+
+        def flag(tag: str, default: bool) -> bool:
+            element = axis.find(tag) if axis is not None else None
+            return is_true(element, self.rule_ctx, self.name) if element is not None else default
+
+        title = axis.find("title") if axis is not None else None
+        label = default_label if title is None else normalize_macro_syntax((title.text or "").strip())
+        return {
+            "name": name,
+            "label": label,
+            "minRange": _number(axis.findtext("minimum") if axis is not None else None, 0),
+            "maxRange": _number(axis.findtext("maximum") if axis is not None else None, 100),
+            "autoRange": flag("autoscale", False),
+            "logMode": flag("log_scale", False),
+            "grid": flag("show_grid", False),
+            "visible": flag("visible", True),
+        }
+
+    def _curve(self, trace: ET.Element, index: int, traces: list[ET.Element] | None = None) -> dict[str, Any] | None:
+        name = self._trace_name(trace, traces or [trace])
         curve: dict[str, Any] = {"name": name}
         for tag, key in (("x_pv", "x_channel"), ("y_pv", "y_channel")):
             text = (trace.findtext(tag) or "").strip()
@@ -485,7 +519,31 @@ class _WidgetLowering:
             if hexed is not None:
                 curve["color"] = hexed
         curve["lineWidth"] = _number(trace.findtext("line_width"), 1)
+        curve["lineStyle"] = _XY_PEN_STYLE.get(_int(trace.findtext("line_style"), 0), 1)
+        curve["symbol"] = _XY_SYMBOL.get(_int(trace.findtext("point_type"), 0), "none")
+        curve["symbolSize"] = _number(trace.findtext("point_size"), 10)
+        curve["traceType"] = "none" if _int(trace.findtext("trace_type"), 1) == 0 else "line"
+        curve["yAxisName"] = f"y{_int(trace.findtext('axis'), 0)}"
         return curve
+
+    @staticmethod
+    def _trace_name(trace: ET.Element, traces: list[ET.Element]) -> str:
+        """The legend name: ``<name>``, else ``y_pv``; ``$(traces[N].field)`` resolves to trace N's field."""
+
+        def text(element: ET.Element, tag: str) -> str:
+            return normalize_macro_syntax((element.findtext(tag) or "").strip())
+
+        element = trace.find("name")
+        if element is None:
+            return text(trace, "y_pv")
+        name = normalize_macro_syntax((element.text or "").strip())
+        match = _XY_TRACE_REF.fullmatch(name)
+        if match is None or int(match.group(1)) >= len(traces):
+            return name
+        target, field_name = traces[int(match.group(1))], match.group(2)
+        if field_name == "name" and target.find("name") is None:
+            return text(target, "y_pv")
+        return text(target, field_name)
 
     # -- rules ----------------------------------------------------------------
     def _rule_pvs(self, rule: BobRule) -> list[tuple[str, bool]] | None:
