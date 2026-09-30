@@ -92,8 +92,6 @@ WARNING_CATEGORIES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         (".opi open_display target", r"^open_display target .* is a legacy \.opi"),
         ("open_display without file", r"^open_display with no file"),
         ("open_display target unknown", r"^open_display target .* unknown; using replace"),
-        ("image not copied", r"^image .* not copied"),
-        ("bool_button images", r"^on/off images not carried"),
         ("tabs", r"^Phoebus tabs need a registry qtPropMap"),
         ("local PV type unsupported", r"^local PV type .* not supported"),
         ("array local PV initializer", r"^array local PV initializer not supported"),
@@ -332,10 +330,8 @@ def test_btsview_converts_within_budget(manifest: Manifest):
 def test_tv_acceptance(manifest: Manifest):
     screen = _milestone(manifest, "bts/embedded/_tv.bob")
     warnings = _warnings(screen)
-    assert len(warnings) == 4, warnings
-    tier2 = [w for w in warnings if _category(w) == "tier-2 script"]
-    images = [w for w in warnings if _category(w) == "bool_button images"]
-    assert len(tier2) == 1 and len(images) == 3
+    assert len(warnings) == 1, warnings
+    assert _category(warnings[0]) == "tier-2 script"
 
     (paddle,) = [n for n in _nodes(screen.root) if any(_category(w) == "tier-2 script" for w in n.warnings)]
     assert paddle.meta is not None and paddle.meta.comment
@@ -346,23 +342,51 @@ def test_tv_acceptance(manifest: Manifest):
     buttons = [n for n in _nodes(screen.root) if n.type == "pv-button"]
     assert buttons
     assert all(n.props["readbackPV"] == n.props["pv"] for n in buttons)
+    # The on/off state images are carried as relative refs, not warned about.
+    assert [(n.props["onImage"], n.props["offImage"]) for n in buttons] == [
+        ("../images/TV on.jpg", "../images/TV off.jpg"),
+        ("../images/Paddle in.jpg", "../images/Paddle out.jpg"),
+        ("../images/Light on.jpg", "../images/Light off.jpg"),
+    ]
 
 
 def test_knob_device_acceptance(manifest: Manifest):
     screen = _milestone(manifest, "common/embedded/_KnobDevice.bob")
     buttons = [n for n in _nodes(screen.root) if n.type == "regular-button"]
     assert any(len(n.props.get("actions") or []) == 16 for n in buttons)
+    # Phoebus <transparent>true</transparent> on both tile buttons.
+    assert len(buttons) == 2
+    assert all(n.props.get("transparent") is True for n in buttons)
+    # An alpha-0 background keeps its alpha instead of turning opaque white.
+    labels = [n for n in _nodes(screen.root) if n.type == "text-label"]
+    assert [n.props.get("backgroundColor") for n in labels] == ["#ffffff00"]
     conditions = [c.expression for n in _nodes(screen.root) for r in n.rules for c in r.conditions]
     assert any("${COLOR_CODE}" in condition for condition in conditions)
 
 
 def test_bpm_curves(manifest: Manifest):
     screen = _milestone(manifest, "gtb/common/embedded/_bpm.bob")
-    (plot,) = [n for n in _nodes(screen.root) if n.type == "waveform-plot"]
-    curves = plot.props["curves"]
-    assert len(curves) == 1
-    assert curves[0]["x_channel"] == "${BPM_X}"
-    assert curves[0]["y_channel"] == "${BPM_Y}"
+    assert not [n for n in _nodes(screen.root) if n.type == "waveform-plot"]
+    (plot,) = [n for n in _nodes(screen.root) if n.type == "xy-plot"]
+    assert plot.props["curves"] == [
+        {
+            "x_channel": "${BPM_X}",
+            "y_channel": "${BPM_Y}",
+            "name": "",
+            "color": "#ff0000",
+            "symbol": "circle",
+            "symbolSize": 7,
+            "traceType": "none",
+            "lineWidth": 1,
+            "lineStyle": 1,
+            "yAxisName": "y0",
+        }
+    ]
+    axis = {"label": "", "autoRange": False, "logMode": False, "grid": True, "visible": True}
+    assert plot.props["xAxis"] == {"name": "x", "minRange": 10, "maxRange": -10, **axis}
+    assert plot.props["yAxes"] == [{"name": "y0", "minRange": -10, "maxRange": 10, **axis}]
+    assert plot.props["showLegend"] is False
+    assert plot.dropped_props == []
 
 
 def test_mem_family_loc_formulas(manifest: Manifest):

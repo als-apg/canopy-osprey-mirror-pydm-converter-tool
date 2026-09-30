@@ -216,15 +216,43 @@
       },
       {
         "id": "w-008",
-        "type": "waveform-plot",
+        "type": "xy-plot",
         "props": {
           "curves": [
             {
               "name": "ok",
               "y_channel": "fox://f-006",
-              "lineWidth": 1
+              "lineWidth": 1,
+              "lineStyle": 1,
+              "symbol": "none",
+              "symbolSize": 10,
+              "traceType": "line",
+              "yAxisName": "y0"
             }
-          ]
+          ],
+          "xAxis": {
+            "name": "x",
+            "label": "X",
+            "minRange": 0,
+            "maxRange": 100,
+            "autoRange": false,
+            "logMode": false,
+            "grid": false,
+            "visible": true
+          },
+          "yAxes": [
+            {
+              "name": "y0",
+              "label": "Y",
+              "minRange": 0,
+              "maxRange": 100,
+              "autoRange": false,
+              "logMode": false,
+              "grid": false,
+              "visible": true
+            }
+          ],
+          "showLegend": true
         },
         "geometry": {
           "x": 0,

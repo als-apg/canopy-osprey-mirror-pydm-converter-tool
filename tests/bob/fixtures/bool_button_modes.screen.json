@@ -98,17 +98,16 @@
           "offLabel": "Off",
           "buttonType": "toggle",
           "onColor": "#3cff3c",
-          "offColor": "#3c643c"
+          "offColor": "#3c643c",
+          "onImage": "on.png",
+          "offImage": "off.png"
         },
         "geometry": {
           "x": 0,
           "y": 120,
           "width": 100,
           "height": 30
-        },
-        "warnings": [
-          "Images: on/off images not carried (asset copying out of scope)"
-        ]
+        }
       }
     ]
   },
