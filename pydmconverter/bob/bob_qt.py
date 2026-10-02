@@ -151,6 +151,12 @@ READBACK_COPY: dict[str, tuple[str, str]] = {
 # Per-type defaults for props Phoebus does not serialise (widget constructor
 # defaults). Keys are Phoebus prop names; the adapter applies them whenever the
 # element is absent, before the prop table.
+#
+# A colour default Phoebus takes from a named widget colour is written as that
+# name ("Text", "Read_Background"), so it follows a configured ``color.def`` (as in
+# Phoebus) and can become a scheme role; with neither it is the built-in RGB.
+# Colours with no Phoebus name (shape fills and lines, LED and bool_button on/off)
+# stay literal hex.
 # --------------------------------------------------------------------------
 BOB_DEFAULTS: dict[str, dict[str, Any]] = {
     "rectangle": {
@@ -172,11 +178,11 @@ BOB_DEFAULTS: dict[str, dict[str, Any]] = {
         "background_color": "#3232ff",
     },
     "polyline": {"line_width": 3},
-    "label": {"transparent": True, "foreground_color": "#000000"},
+    "label": {"transparent": True, "foreground_color": "Text"},
     "textupdate": {
         "transparent": False,
-        "foreground_color": "#000000",
-        "background_color": "#f0f0f0",
+        "foreground_color": "Text",
+        "background_color": "Read_Background",
     },
     "bool_button": {
         "on_label": "On",

@@ -33,7 +33,8 @@ import tokenize
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from pydmconverter.bob.coercion import BUILTIN_NAMED_COLORS, rgba_to_hex
+from pydmconverter.bob.coercion import BUILTIN_NAMED_COLORS
+from pydmconverter.bob.colors import named_color
 from pydmconverter.bob.local_pv import is_gateway_channel, local_pv_key
 from pydmconverter.bob.parser import BobScript, BobWidget, walk_widgets
 from pydmconverter.bob.rules import RuleContext, resolve_target
@@ -534,9 +535,10 @@ def _boilerplate_target(text: str) -> str | None:
     return setter.group("prop")
 
 
-def _alarm_colour(ctx: RuleContext, name: str) -> str:
+def _alarm_colour(ctx: RuleContext, name: str, slot: str) -> str | dict:
+    """The alarm colour ``name`` (a Phoebus named colour); a scheme role under the parity rule."""
     table = ctx.named_colors or {}
-    return rgba_to_hex(table.get(name, BUILTIN_NAMED_COLORS[name]))
+    return named_color(name, table.get(name, BUILTIN_NAMED_COLORS[name]), slot, ctx.color)
 
 
 def match_alarm_boilerplate(
@@ -571,6 +573,6 @@ def match_alarm_boilerplate(
         target_property=target,
         name=script.name or "alarm color",
         pvs=[(pv, True)],
-        conditions=[(condition, _alarm_colour(ctx, colour)) for condition, colour in _ALARM_PALETTE],
-        default=_alarm_colour(ctx, "OK"),
+        conditions=[(condition, _alarm_colour(ctx, colour, prop)) for condition, colour in _ALARM_PALETTE],
+        default=_alarm_colour(ctx, "OK", prop),
     )

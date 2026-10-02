@@ -50,9 +50,8 @@ from pydmconverter.bob.coercion import (
     font_size,
     load_color_def,
     points,
-    rgba_to_hex,
 )
-from pydmconverter.bob.colors import ColorContext
+from pydmconverter.bob.colors import ColorContext, named_color
 from pydmconverter.bob.formula_pv import lower_formula_pv
 from pydmconverter.bob.groups import child_geometry, group_node
 from pydmconverter.bob.local_pv import local_pv_key, plan_declarers, rewrite_local_pv
@@ -138,6 +137,8 @@ _FORMAT = {
 }
 # Named colour Phoebus paints a colour prop with when the widget has no value of its own.
 _RULE_COLOR_FALLBACK = {"background_color": "Background", "foreground_color": "Text"}
+# RGBA of :data:`DISPLAY_BACKGROUND_DEFAULT`, the display background Phoebus paints when none is set.
+_DISPLAY_BACKGROUND_RGB: RGBA = (255, 255, 255, 255)
 # Phoebus polyline ``<arrows>``: 0 NONE, 1 FROM, 2 TO, 3 BOTH.
 _ARROW_START = frozenset({1, 3})
 _ARROW_END = frozenset({2, 3})
@@ -240,11 +241,26 @@ def _geometry(widget: BobWidget, parent: BobWidget | None, origin: tuple[Any, An
     )
 
 
+def _default_value(key: str, value: Any) -> Any:
+    """A ``BOB_DEFAULTS`` value as the adapter lowers it.
+
+    A colour default that names a Phoebus widget colour becomes the element
+    ``<key><color name="..."/></key>``, so it resolves like an authored named colour
+    (``color.def``, scheme role) and a parity note names the prop it colours.
+    """
+    if rule_coercion(key) == "color" and isinstance(value, str) and not value.startswith("#"):
+        element = ET.Element(key)
+        ET.SubElement(element, "color", name=value)
+        return element
+    return value
+
+
 def _effective_props(widget: BobWidget) -> dict[str, Any]:
     """Authored props overlaid on the per-type defaults (defaults only where absent)."""
     props: dict[str, Any] = dict(widget.props)
     for key, value in BOB_DEFAULTS.get(widget.type, {}).items():
-        props.setdefault(key, value)
+        if key not in props:
+            props[key] = _default_value(key, value)
     return props
 
 
@@ -585,7 +601,8 @@ class _WidgetLowering:
                 if fallback is None:
                     self.warn(NO_DEFAULT_WARNING.format(widget=self.name, rule=rule.name))
                     continue
-                spec.default = rgba_to_hex((self.state.named or BUILTIN_NAMED_COLORS)[fallback])
+                table = self.state.named or BUILTIN_NAMED_COLORS
+                spec.default = named_color(fallback, table[fallback], rule.prop_id, self.state.color)
             self.rules.append(spec)
 
     # -- scripts --------------------------------------------------------------
@@ -712,6 +729,10 @@ def _display_to_ir(
         background = coerce_value(
             "color", bg, RuleContext(named_colors=named, warnings=file_warnings, color=color), "display"
         )
+    elif color is not None:
+        # An undeclared display background is the scheme's Display_Background when its
+        # light value is Phoebus's white; otherwise the literal white, with a parity note.
+        background = named_color("Display_Background", _DISPLAY_BACKGROUND_RGB, "background_color", color)
     # Scheme parity notes are aggregated over the whole document and lead the file warnings.
     if color is not None:
         file_warnings[:0] = color.parity_notes()

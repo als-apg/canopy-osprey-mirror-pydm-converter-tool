@@ -149,11 +149,13 @@ def test_defaults_match_proposal():
     assert bob_qt.BOB_DEFAULTS["ellipse"] == {**shape, "background_color": "#1e90ff"}
     assert bob_qt.BOB_DEFAULTS["polygon"] == {**shape, "background_color": "#3232ff"}
     assert bob_qt.BOB_DEFAULTS["polyline"] == {"line_width": 3}
-    assert bob_qt.BOB_DEFAULTS["label"] == {"transparent": True, "foreground_color": "#000000"}
+    # Phoebus-named widget colours are written as their names (resolved through
+    # color.def / the built-ins: Text = #000000, Read_Background = #f0f0f0).
+    assert bob_qt.BOB_DEFAULTS["label"] == {"transparent": True, "foreground_color": "Text"}
     assert bob_qt.BOB_DEFAULTS["textupdate"] == {
         "transparent": False,
-        "foreground_color": "#000000",
-        "background_color": "#f0f0f0",
+        "foreground_color": "Text",
+        "background_color": "Read_Background",
     }
     assert bob_qt.BOB_DEFAULTS["bool_button"] == {
         "on_label": "On",
