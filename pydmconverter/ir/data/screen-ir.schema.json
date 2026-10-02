@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://controls.slac.stanford.edu/schemas/screen-ir/1.0/schema.json",
+  "$id": "https://controls.slac.stanford.edu/schemas/screen-ir/1.1/schema.json",
   "title": "Canopy Screen IR",
   "description": "Canonical Canopy screen Intermediate Representation. Owned by @canopy/screen-ir; mirrors the TypeScript types in src/. This file is the structural subset of the contract; cross-field rules (macro defaults, the Rule union arm, fox:// resolution) are enforced by validate()'s semantic layer.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "kind", "id", "metadata", "macros", "root"],
   "properties": {
-    "schemaVersion": { "const": "1.0" },
+    "schemaVersion": { "enum": ["1.0", "1.1"] },
     "kind": { "enum": ["screen", "template"] },
     "id": { "type": "string" },
     "metadata": { "$ref": "#/$defs/ScreenMetadata" },
@@ -125,10 +125,21 @@
       "required": ["expression", "value"],
       "properties": {
         "expression": { "type": "string" },
-        "value": { "type": ["string", "number", "boolean", "null"] }
+        "value": { "anyOf": [{ "$ref": "#/$defs/RuleScalar" }, { "$ref": "#/$defs/ColorRole" }] }
       }
     },
     "RuleScalar": { "type": ["string", "number", "boolean", "null"] },
+    "ColorRole": {
+      "description": "Themeable color reference at a rule position: a theme role name with hex fallbacks for light and (optionally) dark themes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["$role", "fallback"],
+      "properties": {
+        "$role": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "fallback": { "type": "string", "pattern": "^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+        "fallbackDark": { "type": "string", "pattern": "^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" }
+      }
+    },
     "Rule": {
       "description": "Discriminated union: conditional arm (pvs + conditions, what the converter emits) or formula arm (formula). validate() enforces exactly one arm.",
       "type": "object",
@@ -141,7 +152,9 @@
             "id": { "type": "string" },
             "name": { "type": "string" },
             "targetProperty": { "type": "string" },
-            "default": { "$ref": "#/$defs/RuleScalar" },
+            "default": {
+              "anyOf": [{ "$ref": "#/$defs/RuleScalar" }, { "$ref": "#/$defs/ColorRole" }]
+            },
             "pvs": { "type": "array", "items": { "$ref": "#/$defs/RulePvBinding" } },
             "conditions": { "type": "array", "items": { "$ref": "#/$defs/RuleCondition" } }
           }

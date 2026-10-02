@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://controls.slac.stanford.edu/schemas/canopy-color-scheme/1/schema.json",
+  "title": "Canopy Color Scheme",
+  "description": "canopy-color-scheme/1: a facility color scheme layered on canopy-default. Roles merge per role and per mode; an import value of null deletes an inherited mapping. Colors are canonicalised and import targets resolved when the scheme is flattened, not by this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "extends": { "const": "canopy-default" },
+    "roles": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Name" },
+      "additionalProperties": { "$ref": "#/$defs/RoleValue" }
+    },
+    "import": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phoebus": { "$ref": "#/$defs/ImportMap" },
+        "edm": { "$ref": "#/$defs/ImportMap" }
+      }
+    }
+  },
+  "$defs": {
+    "Name": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "Hex": { "type": "string", "pattern": "^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$" },
+    "Alias": {
+      "description": "A reference to another role: '@' followed by a 1-64 character role name.",
+      "type": "string",
+      "pattern": "^@.{1,64}$"
+    },
+    "Color": { "anyOf": [{ "$ref": "#/$defs/Hex" }, { "$ref": "#/$defs/Alias" }] },
+    "RoleValue": {
+      "description": "One color for both modes, or a per-mode object whose omitted modes are inherited.",
+      "anyOf": [
+        { "$ref": "#/$defs/Color" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "light": { "$ref": "#/$defs/Color" },
+            "dark": { "$ref": "#/$defs/Color" }
+          }
+        }
+      ]
+    },
+    "ImportMap": {
+      "description": "Maps a source color name to a role name; null deletes an inherited mapping.",
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Name" },
+      "additionalProperties": { "anyOf": [{ "$ref": "#/$defs/Name" }, { "type": "null" }] }
+    }
+  }
+}
