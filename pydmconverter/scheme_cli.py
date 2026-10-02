@@ -6,12 +6,18 @@ that has no dark value; it exits 1 when there is any.
 ``survey <dir>... [--scheme <file>] [--corpus-root <dir>]`` counts the ``<color>`` elements of the ``.bob`` files
 under the directories, per ``(name, slot, saved RGB)``, and says what each would become under the scheme.
 
+``from-colordef [--color-def <file>] --extends canopy-default --into <file> [--id <id>] [--keep-light-aliases]``
+writes the light value of every name in a colour table (the built-in Phoebus table, or a ``color.def``) into a
+scheme file, keeping each role's dark value. ``Name = Other`` and ``alias(Other)`` become the light alias
+``"@Other"``. Names in the file but not in the table are reported as removed and left in place.
+
 The corpus rule (which files count) is a copy of ``tests/bob/corpus_manifest.py``; a test pins the two together.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import xml.etree.ElementTree as ET
@@ -19,6 +25,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 
+from pydmconverter.bob.coercion import BUILTIN_NAMED_COLORS, _parse_rgba_list
 from pydmconverter.bob.colors import ColorContext, rgba_to_hex
 from pydmconverter.scheme import SchemeResult, canonical_hex, load_scheme
 
@@ -168,6 +175,129 @@ def check(path: Path, out) -> int:
     return 0
 
 
+def parse_color_table(path: Path | None, warnings: list[str]) -> dict[str, str]:
+    """A colour table as ``{name: "#hex" | "@Other"}`` in table order: the built-ins, or the entries of ``path``.
+
+    ``color.def`` grammar: ``Name = r, g, b [, a]`` | ``Name = Other`` | ``Name = alias(Other)``, ``#`` comments.
+    Both reference forms keep the reference as a light alias. ``Other`` must be a built-in or defined earlier in the
+    file. Lines that do not parse, or reference an undefined name, are skipped with a warning.
+    """
+    if path is None:
+        return {name: canonical_hex(rgba_to_hex(rgba)) for name, rgba in BUILTIN_NAMED_COLORS.items()}
+    known = set(BUILTIN_NAMED_COLORS)
+    table: dict[str, str] = {}
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, sep, value = (s.strip() for s in line.partition("="))
+        if not sep or not name:
+            warnings.append(f"{path}:{lineno}: cannot parse '{line}'")
+            continue
+        ref = None
+        if value.startswith("alias"):
+            rest = value[5:].strip()
+            if not (rest.startswith("(") and rest.endswith(")")):
+                warnings.append(f"{path}:{lineno}: cannot parse color '{name}' from '{value}'")
+                continue
+            ref = rest[1:-1].strip()
+        elif value in known:
+            ref = value
+        if ref is not None:
+            if ref not in known:
+                warnings.append(f"{path}:{lineno}: color '{name}' references undefined '{ref}'")
+                continue
+            table[name] = f"@{ref}"
+        else:
+            rgba = _parse_rgba_list(value)
+            if rgba is None:
+                warnings.append(f"{path}:{lineno}: cannot parse color '{name}' from '{value}'")
+                continue
+            table[name] = canonical_hex(rgba_to_hex(rgba))
+        known.add(name)
+    return table
+
+
+def _is_alias(value: object) -> bool:
+    return isinstance(value, str) and value.startswith("@")
+
+
+def merge_light(roles: dict, table: dict[str, str], keep_light_aliases: bool) -> tuple[list[str], list[str]]:
+    """Write ``table`` as light values into ``roles`` in place; returns ``(added, changed)`` names.
+
+    Every touched role ends in the per-mode form: a bare value becomes the dark value, an object keeps its dark.
+    With ``keep_light_aliases`` an existing light alias is kept instead of replaced.
+    """
+    added: list[str] = []
+    changed: list[str] = []
+    for name, new in table.items():
+        if name not in roles:
+            roles[name] = {"light": new}
+            added.append(name)
+            continue
+        old = roles[name]
+        if isinstance(old, dict):
+            value = dict(old)
+            old_light = old.get("light")
+        else:
+            value = {"light": old, "dark": old}
+            old_light = old
+        if not (keep_light_aliases and _is_alias(old_light)):
+            value["light"] = new
+        value = {mode: value[mode] for mode in ("light", "dark") if mode in value} | value
+        if value != old:
+            roles[name] = value
+            if value.get("light") != old_light:
+                changed.append(name)
+    return added, changed
+
+
+def from_colordef(
+    color_def: Path | None, extends: str, into: Path, scheme_id: str | None, keep_light_aliases: bool, out, err
+) -> int:
+    if into.exists():
+        try:
+            doc = json.loads(into.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"{into}: cannot read scheme: {exc}", file=err)
+            return 1
+        if not isinstance(doc, dict) or not isinstance(doc.get("roles", {}), dict):
+            print(f"{into}: not a scheme object with a 'roles' object", file=err)
+            return 1
+        if scheme_id is not None and doc.get("id") != scheme_id:
+            print(f"{into}: --id {scheme_id!r} does not match the file's id {doc.get('id')!r}", file=err)
+            return 1
+    else:
+        if not scheme_id:
+            print(f"{into}: file does not exist; pass --id to create it", file=err)
+            return 1
+        doc = {"id": scheme_id, "extends": extends, "roles": {}}
+
+    warnings: list[str] = []
+    try:
+        table = parse_color_table(color_def, warnings)
+    except OSError as exc:
+        print(f"{color_def}: cannot read: {exc.strerror or exc}", file=err)
+        return 1
+    for warning in warnings:
+        print(f"warning: {warning}", file=err)
+
+    roles = doc.setdefault("roles", {})
+    removed = [name for name in roles if name not in table]
+    added, changed = merge_light(roles, table, keep_light_aliases)
+
+    tmp = into.with_name(into.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, into)
+
+    for label, names in (("added", added), ("changed", changed), ("removed", removed)):
+        for name in names:
+            print(f"{label}: {name}", file=out)
+    print(f"{into}: {len(added)} added, {len(changed)} changed, {len(removed)} removed (kept, not deleted)", file=out)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="canopy-scheme", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -177,10 +307,20 @@ def main(argv: list[str] | None = None) -> int:
     p_survey.add_argument("dirs", nargs="+", type=Path)
     p_survey.add_argument("--scheme", type=Path, default=None)
     p_survey.add_argument("--corpus-root", type=Path, default=None)
+    p_gen = sub.add_parser("from-colordef", help="write a colour table's light values into a scheme file")
+    p_gen.add_argument("--color-def", type=Path, default=None, help="a Phoebus color.def (default: built-in table)")
+    p_gen.add_argument("--extends", required=True, choices=["canopy-default"])
+    p_gen.add_argument("--into", type=Path, required=True, help="the scheme file to update or create")
+    p_gen.add_argument("--id", default=None, help="scheme id; required when --into does not exist")
+    p_gen.add_argument("--keep-light-aliases", action="store_true", help="keep hand-written light aliases")
     args = parser.parse_args(argv)
 
     if args.command == "check":
         return check(args.file, sys.stdout)
+    if args.command == "from-colordef":
+        return from_colordef(
+            args.color_def, args.extends, args.into, args.id, args.keep_light_aliases, sys.stdout, sys.stderr
+        )
     scheme = load_scheme(args.scheme) if args.scheme is not None else None
     if scheme is not None and scheme.meta["errors"]:
         print(f"{args.scheme}: scheme has errors; run 'canopy-scheme check'", file=sys.stderr)
