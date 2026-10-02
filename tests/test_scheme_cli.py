@@ -7,8 +7,6 @@ import os
 import shutil
 from pathlib import Path, PurePosixPath
 
-import pytest
-
 from pydmconverter import scheme_cli
 from pydmconverter.scheme import DEFAULT_SCHEME_PATH
 from tests.bob import corpus_manifest
