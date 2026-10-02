@@ -136,3 +136,50 @@ def test_convert_folder_includes_bob(tmp_path):
     found, failed = react.convert_folder(src, tmp_path / "out", override=True)
     assert (found, failed) == (1, [])
     assert (tmp_path / "out" / "a.screen.json").is_file()
+
+
+# -- scheme keyword ------------------------------------------------------------------------------------------------
+
+_NAMED_BG = (
+    b'<display version="2.0.0"><name>t</name><background_color>'
+    b'<color name="Display_Background" red="255" green="255" blue="255"/></background_color></display>'
+)
+
+
+def test_convert_bytes_bob_passes_scheme():
+    from pydmconverter.bob.ir_adapter import bob_bytes_to_ir
+    from pydmconverter.scheme import load_scheme
+
+    scheme = load_scheme(None)
+    ir = react.convert_bytes(_NAMED_BG, kind="bob", scheme=scheme)
+    expected = bob_bytes_to_ir(_NAMED_BG, scheme=scheme).model_copy(update={"schema_version": "1.1"})
+    assert ir == expected
+    _assert_valid(ir)
+
+
+def test_convert_bytes_edl_and_ui_accept_scheme():
+    from pydmconverter.scheme import load_scheme
+
+    scheme = load_scheme(None)
+    assert react.convert_bytes(EDM_FIXTURE.read_bytes(), kind="edl", scheme=scheme) == react.convert_bytes(
+        EDM_FIXTURE.read_bytes(), kind="edl"
+    )
+    assert react.convert_bytes(UI_FIXTURE.read_bytes(), kind="ui", scheme=scheme) == react.convert_bytes(
+        UI_FIXTURE.read_bytes(), kind="ui"
+    )
+
+
+def test_convert_file_and_folder_pass_scheme(tmp_path):
+    from pydmconverter.scheme import load_scheme
+
+    scheme = load_scheme(None)
+    src = tmp_path / "in"
+    src.mkdir()
+    (src / "a.bob").write_bytes(_NAMED_BG)
+    out = react.convert_file(src / "a.bob", tmp_path / "one", scheme=scheme)
+    assert json.loads(out.read_text(encoding="utf-8"))["schemaVersion"] == "1.1"
+    found, failed = react.convert_folder(src, tmp_path / "out", scheme=scheme)
+    assert (found, failed) == (1, [])
+    assert json.loads((tmp_path / "out" / "a.screen.json").read_text(encoding="utf-8"))["schemaVersion"] == "1.1"
+    found, failed = react.convert_folder(src, tmp_path / "plain")
+    assert json.loads((tmp_path / "plain" / "a.screen.json").read_text(encoding="utf-8"))["schemaVersion"] == "1.0"

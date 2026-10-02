@@ -4,6 +4,7 @@ import argparse
 import subprocess
 import sys
 from pydmconverter.edm.converter import convert
+from pydmconverter.scheme import load_scheme
 from pathlib import Path
 import logging
 
@@ -40,9 +41,10 @@ def run(
     target="pydm",
     out_format="json",
     color_def=None,
+    scheme=None,
 ):
     if target == "react":
-        run_react(input_file, output_file, override, site=site, calc_list=calc_list, color_def=color_def)
+        run_react(input_file, output_file, override, site=site, calc_list=calc_list, color_def=color_def, scheme=scheme)
         return
 
     input_path: Path = Path(input_file)
@@ -76,10 +78,11 @@ def run(
             print(f"Failed files: {', '.join(map(lambda path: str(path), files_failed))}")
 
 
-def run_react(input_file, output_file, override, site=None, calc_list=None, color_def=None) -> None:
+def run_react(input_file, output_file, override, site=None, calc_list=None, color_def=None, scheme=None) -> None:
     """Convert .edl/.ui/.bob to Canopy Screen IR JSON (the --target react path).
 
-    ``color_def`` is a Phoebus ``color.def`` applied to ``.bob`` inputs only.
+    ``color_def`` is a Phoebus ``color.def`` applied to ``.bob`` inputs only. ``scheme`` is a loaded
+    :class:`pydmconverter.scheme.SchemeResult` (or ``None``) passed through to the converter.
     """
     from pydmconverter import react
 
@@ -87,13 +90,25 @@ def run_react(input_file, output_file, override, site=None, calc_list=None, colo
     output_path = Path(output_file)
     if input_path.is_file():
         out = react.convert_file(
-            input_path, output_path, override=override, calc_list_path=calc_list, site=site, color_def_path=color_def
+            input_path,
+            output_path,
+            override=override,
+            calc_list_path=calc_list,
+            site=site,
+            color_def_path=color_def,
+            scheme=scheme,
         )
         print(f"Converted {input_path} -> {out}")
     else:
         output_path.mkdir(parents=True, exist_ok=True)
         found, failed = react.convert_folder(
-            input_path, output_path, override=override, calc_list_path=calc_list, site=site, color_def_path=color_def
+            input_path,
+            output_path,
+            override=override,
+            calc_list_path=calc_list,
+            site=site,
+            color_def_path=color_def,
+            scheme=scheme,
         )
         if found == 0:
             print(f"No {' or '.join(react.SUPPORTED_SUFFIXES)} files found in {input_path}")
@@ -101,6 +116,26 @@ def run_react(input_file, output_file, override, site=None, calc_list=None, colo
             print(f"{found - len(failed)} files converted from {input_path}")
         if failed:
             print(f"{len(failed)} files failed to convert. Use --override or -o to overwrite existing files.")
+
+
+def load_cli_scheme(path):
+    """Load ``--scheme <file>``; return ``(scheme, failed)``.
+
+    With no path, returns ``(None, False)`` and nothing is loaded, so output is unchanged. Otherwise every
+    ``meta["errors"]`` entry is printed to stderr, and ``failed`` is true when there are errors or the scheme
+    served is not the file's own (``served != id``). A failed scheme still converts with the scheme
+    ``load_scheme`` served (``canopy-default``); the caller turns ``failed`` into a non-zero exit.
+    """
+    if path is None:
+        return None, False
+    scheme = load_scheme(Path(path))
+    meta = scheme.meta
+    for error in meta["errors"]:
+        print(f"scheme {path}: {error['path'] or '<root>'}: {error['message']}", file=sys.stderr)
+    failed = bool(meta["errors"]) or meta["served"] != meta["id"]
+    if failed and not meta["errors"]:
+        print(f"scheme {path}: served {meta['served']!r}, not the file's id {meta['id']!r}", file=sys.stderr)
+    return scheme, failed
 
 
 def run_cli(args: argparse.Namespace) -> None:
@@ -120,6 +155,7 @@ def run_cli(args: argparse.Namespace) -> None:
     scrollable: bool = args.scrollable
     site: str = args.site
     calc_list: str = args.calc_list
+    scheme, scheme_failed = load_cli_scheme(args.scheme)
     run(
         input_file,
         output_file,
@@ -131,7 +167,10 @@ def run_cli(args: argparse.Namespace) -> None:
         target=args.target,
         out_format=args.format,
         color_def=args.color_def,
+        scheme=scheme,
     )
+    if scheme_failed:
+        sys.exit(1)
 
 
 """
@@ -304,6 +343,13 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to a Phoebus color.def used to resolve named colors in .bob inputs (--target react only)",
+    )
+    parser.add_argument(
+        "--scheme",
+        type=str,
+        default=None,
+        help="Path to a canopy-color-scheme/1 facility scheme; named colors it imports become color roles "
+        "(--target react, .bob inputs). Scheme errors are printed and the exit status is non-zero",
     )
     parser.add_argument(
         "--target",

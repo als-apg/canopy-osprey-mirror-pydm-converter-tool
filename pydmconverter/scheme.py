@@ -123,6 +123,45 @@ def load_scheme(path: Path | None, *, base_path: Path | None = None) -> SchemeRe
     return _result(_to_flat(roles), imports, scheme_id, digest, scheme_id or DEFAULT_ID, [])
 
 
+#: The SDK's ``ColorRole`` shape (``colorRole.ts``): only these keys, ``$role`` 1-64 UTF-16 units, hex fallbacks.
+_ROLE_KEYS = frozenset({"$role", "fallback", "fallbackDark"})
+_ROLE_HEX = re.compile(r"#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
+_ROLE_MAX_LENGTH = 64
+
+
+def _is_color_role(node: Any) -> bool:
+    """Mirror of the SDK's ``isColorRole``: a well-formed ``{"$role", "fallback", "fallbackDark"?}`` dict."""
+    if not isinstance(node, dict) or not set(node) <= _ROLE_KEYS:
+        return False
+    role = node.get("$role")
+    if not isinstance(role, str) or not 1 <= len(role.encode("utf-16-le")) // 2 <= _ROLE_MAX_LENGTH:
+        return False
+
+    def is_hex(value: Any) -> bool:
+        return isinstance(value, str) and _ROLE_HEX.fullmatch(value) is not None
+
+    return is_hex(node.get("fallback")) and ("fallbackDark" not in node or is_hex(node["fallbackDark"]))
+
+
+def _contains_color_role(node: Any) -> bool:
+    if _is_color_role(node):
+        return True
+    if isinstance(node, dict):
+        return any(_contains_color_role(value) for value in node.values())
+    if isinstance(node, (list, tuple)):
+        return any(_contains_color_role(value) for value in node)
+    return False
+
+
+def stamp_schema_version(doc: Any) -> str:
+    """The Screen IR ``schemaVersion`` a wire doc must carry: ``"1.1"`` iff it contains a colour role, else ``"1.0"``.
+
+    Mirrors the SDK's ``stampSchemaVersion``: a deep walk over dict values and list items for a well-formed
+    ``ColorRole``. The doc's own ``schemaVersion`` is a string, so it never counts. Never raises.
+    """
+    return "1.1" if _contains_color_role(doc) else "1.0"
+
+
 # -- internals -----------------------------------------------------------------------------------------------------
 
 

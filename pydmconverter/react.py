@@ -18,9 +18,10 @@ from typing import Literal
 
 from pydmconverter.bob.ir_adapter import bob_file_to_ir
 from pydmconverter.edm.ir_adapter import edm_file_to_ir
-from pydmconverter.ir.emit import write_screen_json
+from pydmconverter.ir.emit import to_wire_dict, write_screen_json
 from pydmconverter.ir.model import ScreenIR
 from pydmconverter.ir.registry import RegistryClient
+from pydmconverter.scheme import SchemeResult, stamp_schema_version
 from pydmconverter.ui.ir_adapter import ui_file_to_ir
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ def convert_to_ir(
     calc_list_path: str | Path | None = None,
     site: str | None = None,
     color_def_path: str | Path | None = None,
+    scheme: SchemeResult | None = None,
 ) -> ScreenIR:
     """Parse an ``.edl``, ``.ui`` or ``.bob`` file into a Screen IR, dispatching by suffix.
 
@@ -45,22 +47,30 @@ def convert_to_ir(
     the ``EDMCOLORFILE`` env var, ``$EDMFILES/colors.list``, then ``/etc/edm/colors.list``.
     ``color_def_path`` (``.bob`` inputs only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
+    ``scheme`` (``.bob`` inputs only, for now) is a flattened colour scheme whose imported names
+    become colour roles. The result is stamped ``schema_version`` ``"1.1"`` iff it carries a
+    role (:func:`pydmconverter.scheme.stamp_schema_version`); it is never validated here.
     """
     suffix = Path(input_path).suffix.lower()
     adapter = _ADAPTERS.get(suffix)
     if adapter is None:
         raise ValueError(f"--target react supports {', '.join(SUPPORTED_SUFFIXES)} inputs, not {suffix!r}")
     if suffix == ".edl":
-        return edm_file_to_ir(
+        ir = edm_file_to_ir(
             input_path,
             registry=registry,
             color_list_path=color_list_path,
             calc_list_path=calc_list_path,
             site=site,
         )
-    if suffix == ".bob":
-        return bob_file_to_ir(input_path, registry=registry, color_def_path=color_def_path)
-    return ui_file_to_ir(input_path, registry=registry)
+    elif suffix == ".bob":
+        ir = bob_file_to_ir(input_path, registry=registry, color_def_path=color_def_path, scheme=scheme)
+    else:
+        ir = ui_file_to_ir(input_path, registry=registry)
+    # Stamp here, the one point every entry point flows through, so callers that take the ScreenIR (not the
+    # written JSON) see the right version. Role-free screens keep "1.0" and are byte-identical to before.
+    ir.schema_version = stamp_schema_version(to_wire_dict(ir))
+    return ir
 
 
 def convert_bytes(
@@ -72,6 +82,7 @@ def convert_bytes(
     calc_list_path: str | Path | None = None,
     site: str | None = None,
     color_def_path: str | Path | None = None,
+    scheme: SchemeResult | None = None,
 ) -> ScreenIR:
     """Parse raw ``.edl``/``.ui``/``.bob`` bytes into a Screen IR, keyed on ``kind``.
 
@@ -85,6 +96,7 @@ def convert_bytes(
     ``EDMCOLORFILE`` env var, then ``$EDMFILES/colors.list``, then ``/etc/edm/colors.list``.
     ``color_def_path`` (``kind="bob"`` only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
+    ``scheme`` is a flattened colour scheme; see :func:`convert_to_ir`.
     """
     if kind not in ("edl", "ui", "bob"):
         raise ValueError(f"convert_bytes kind must be 'edl', 'ui' or 'bob', not {kind!r}")
@@ -101,6 +113,7 @@ def convert_bytes(
             calc_list_path=calc_list_path,
             site=site,
             color_def_path=color_def_path,
+            scheme=scheme,
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -123,6 +136,7 @@ def convert_file(
     calc_list_path: str | Path | None = None,
     site: str | None = None,
     color_def_path: str | Path | None = None,
+    scheme: SchemeResult | None = None,
 ) -> Path:
     """Convert one ``.edl``/``.ui``/``.bob`` file to ``*.screen.json``; return the output path.
 
@@ -131,6 +145,7 @@ def convert_file(
     ``EDMCOLORFILE`` env var, then ``$EDMFILES/colors.list``, then ``/etc/edm/colors.list``.
     ``color_def_path`` (``.bob`` inputs only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
+    ``scheme`` is a flattened colour scheme; see :func:`convert_to_ir`.
     """
     inp = Path(input_path)
     out = _screen_json_path(inp, Path(output_path))
@@ -144,6 +159,7 @@ def convert_file(
             calc_list_path=calc_list_path,
             site=site,
             color_def_path=color_def_path,
+            scheme=scheme,
         ),
         out,
     )
@@ -159,6 +175,7 @@ def convert_folder(
     calc_list_path: str | Path | None = None,
     site: str | None = None,
     color_def_path: str | Path | None = None,
+    scheme: SchemeResult | None = None,
 ) -> tuple[int, list[str]]:
     """Recursively convert every ``.edl``/``.ui``/``.bob`` under ``input_dir``.
 
@@ -169,6 +186,7 @@ def convert_folder(
     ``EDMCOLORFILE`` env var, then ``$EDMFILES/colors.list``, then ``/etc/edm/colors.list``.
     ``color_def_path`` (``.bob`` inputs only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
+    ``scheme`` is a flattened colour scheme; see :func:`convert_to_ir`.
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
@@ -193,6 +211,7 @@ def convert_folder(
                     calc_list_path=calc_list_path,
                     site=site,
                     color_def_path=color_def_path,
+                    scheme=scheme,
                 ),
                 out,
             )
