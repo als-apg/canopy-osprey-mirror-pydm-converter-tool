@@ -26,8 +26,9 @@ import json
 import re
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
+from pydmconverter.bob.colors import ColorContext, ColorValue, named_color
 from pydmconverter.edm.edm_qt import (
     EDM_PRIMARY_CHANNEL_ORDER,
     EDM_READBACK_CHANNEL_ORDER,
@@ -48,6 +49,9 @@ from pydmconverter.ir.model import Number, ScreenIR
 from pydmconverter.ir.registry import RegistryClient, VendoredRegistry
 from pydmconverter.ir.source import RuleSpec, SourceNode
 from pydmconverter.ir.transforms import screen_ref
+
+if TYPE_CHECKING:
+    from pydmconverter.scheme import SchemeResult
 
 # An EDM visibility spec: (visPv, visMin, visMax, visInvert). visMin/visMax are
 # None when the EDM object only declares visPv (visible-when-nonzero).
@@ -209,6 +213,38 @@ def edm_color_to_hex(value: Any, color_data: dict[str, Any] | None) -> str | Non
         blue = min(255, max(0, int(blue * scale)))
 
     return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def edm_color_name(value: Any, color_data: dict[str, Any] | None) -> str | None:
+    """The ``colors.list`` name of an ``"index N"`` colour, or ``None``.
+
+    ``"rgb ..."`` literals, unknown indices and a missing palette have no name.
+    """
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"index\s+(\d+)", value.strip())
+    if match is None:
+        return None
+    entry = ((color_data or {}).get("static") or {}).get(int(match.group(1)))
+    name = entry.get("name") if isinstance(entry, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def edm_color_value(
+    value: Any, color_data: dict[str, Any] | None, slot: str, color: ColorContext | None
+) -> ColorValue | None:
+    """The IR value of an EDM colour prop: :func:`edm_color_to_hex`, or a scheme role.
+
+    With a :class:`ColorContext` (``import_kind="edm"``), a palette name the scheme imports
+    becomes ``{"$role", "fallback"}`` under the parity rule of
+    :func:`~pydmconverter.bob.colors.named_color`; the fallback is the hex written without a
+    scheme. ``slot`` is the EDM attribute, named in parity notes. ``None`` when unresolvable.
+    """
+    hex_color = edm_color_to_hex(value, color_data)
+    if hex_color is None or color is None:
+        return hex_color
+    rgb = (int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16), 255)
+    return named_color(edm_color_name(value, color_data), rgb, slot, color)
 
 
 # Classes whose registry definition maps a readback channel (readbackChannel ->
@@ -738,7 +774,9 @@ def _tracking_reads(obj: EDMObject) -> Iterator[_ReadTrackingProps]:
         obj.properties = original
 
 
-def _object_to_source(obj: EDMObject, colors: dict[str, Any] | None = None) -> SourceNode:
+def _object_to_source(
+    obj: EDMObject, colors: dict[str, Any] | None = None, color: ColorContext | None = None
+) -> SourceNode:
     """Normalize one EDM object, recording the props it silently drops.
 
     Every ``obj.properties`` lookup during the call (class resolution, the mapping
@@ -749,13 +787,13 @@ def _object_to_source(obj: EDMObject, colors: dict[str, Any] | None = None) -> S
     around this call so those reads count too.
     """
     with _tracking_reads(obj) as tracked:
-        node = _convert_object(obj, colors)
+        node = _convert_object(obj, colors, color)
         if node.qt_class is not None:
             node.dropped_props = [key for key in tracked if key not in EDM_TO_QT_PROP and key not in tracked.read]
     return node
 
 
-def _convert_object(obj: EDMObject, colors: dict[str, Any] | None) -> SourceNode:
+def _convert_object(obj: EDMObject, colors: dict[str, Any] | None, color: ColorContext | None = None) -> SourceNode:
     qt_class = resolve_qt_class(obj.name.lower(), obj.properties)
     qt_props: dict[str, Any] = {}
     warnings: list[str] = []
@@ -772,7 +810,7 @@ def _convert_object(obj: EDMObject, colors: dict[str, Any] | None) -> SourceNode
                     # EDM writes bgColor even when the object uses the display
                     # background; emitting it would paint a spurious background.
                     continue
-                hex_color = edm_color_to_hex(value, colors)
+                hex_color = edm_color_value(value, colors, edm_attr, color)
                 if hex_color is None:
                     warnings.append(f"EDM color '{value}' for {edm_attr} could not be resolved; prop dropped")
                     continue
@@ -881,7 +919,11 @@ def _visibility_rule_spec(vis_tuples: list[VisTuple]) -> RuleSpec:
 
 
 def edm_group_to_source_nodes(
-    group: EDMGroup, *, colors: dict[str, Any] | None = None, skip_classes: frozenset[str] = frozenset()
+    group: EDMGroup,
+    *,
+    colors: dict[str, Any] | None = None,
+    skip_classes: frozenset[str] = frozenset(),
+    color: ColorContext | None = None,
 ) -> list[SourceNode]:
     """Materialize an EDM group tree into a list of widget SourceNodes.
 
@@ -894,7 +936,8 @@ def edm_group_to_source_nodes(
     itself and hides the whole subtree — no inheritance onto individual descendants.
 
     ``colors`` is the parsed ``colors.list`` palette (see :func:`edm_file_to_ir`), used
-    to resolve "index N" color props to hex.
+    to resolve "index N" color props to hex. ``color`` (a scheme's :class:`ColorContext`)
+    turns imported palette names into roles; see :func:`edm_color_value`.
     """
     nodes: list[SourceNode] = []
     for obj in group.objects:
@@ -906,7 +949,7 @@ def edm_group_to_source_nodes(
                     if isinstance(leaf, EDMObject):
                         leaves.enter_context(_tracking_reads(leaf))
                 symbol_vis = _symbol_state_vis(obj)
-                children = edm_group_to_source_nodes(obj, colors=colors, skip_classes=skip_classes)
+                children = edm_group_to_source_nodes(obj, colors=colors, skip_classes=skip_classes, color=color)
             group_node = SourceNode(
                 qt_class=None,
                 registry_id="group",
@@ -931,7 +974,7 @@ def edm_group_to_source_nodes(
             with _tracking_reads(obj):
                 # Visibility is read first so its keys count as used by the node.
                 own_vis = _vis_tuple(obj.properties)
-                node = _object_to_source(obj, colors)
+                node = _object_to_source(obj, colors, color)
             if own_vis is not None:
                 # Append: the node may already carry alarm-color rules.
                 node.rules.append(_visibility_rule_spec([own_vis]))
@@ -946,6 +989,7 @@ def edm_file_to_ir(
     color_list_path: str | Path | None = None,
     calc_list_path: str | Path | None = None,
     site: str | None = None,
+    scheme: SchemeResult | None = None,
 ) -> ScreenIR:
     """Parse an ``.edl`` file and build its Screen IR.
 
@@ -961,6 +1005,11 @@ def edm_file_to_ir(
     ``$EDMFILES/calc.list``, then beside ``$EDMCOLORFILE``. Unresolvable named
     calcs stay as warnings. ``site`` applies site skip rules (same vocabulary as
     the PyDM target, e.g. ``"slac"`` drops exit buttons).
+
+    With a flattened colour ``scheme``, ``colors.list`` names the scheme imports
+    (``import.edm``) become roles under the parity rule (:func:`edm_color_value`), and the
+    document's ``parity: `` notes lead the first node's warnings. ``None`` keeps today's
+    literal hex.
     """
     from pydmconverter.sites import get_skip_widgets
 
@@ -974,7 +1023,11 @@ def edm_file_to_ir(
     colors_path = search_color_list(str(color_list_path) if color_list_path else None)
     colors = parse_colors_list(colors_path)
     skip_classes = frozenset(get_skip_widgets(site))
-    top_level = edm_group_to_source_nodes(parser.ui, colors=colors, skip_classes=skip_classes)
+    color = None if scheme is None else ColorContext.from_scheme(scheme, import_kind="edm")
+    top_level = edm_group_to_source_nodes(parser.ui, colors=colors, skip_classes=skip_classes, color=color)
+    # Scheme parity notes are aggregated over the whole document and lead the first node's warnings.
+    if color is not None and top_level:
+        top_level[0].warnings[:0] = color.parity_notes()
     builder = IRBuilder(registry or VendoredRegistry())
     # Screen background: the parser resolves bgColor to an (r, g, b, a) tuple.
     background: str | None = None

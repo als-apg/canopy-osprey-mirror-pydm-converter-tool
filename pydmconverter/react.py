@@ -47,8 +47,8 @@ def convert_to_ir(
     the ``EDMCOLORFILE`` env var, ``$EDMFILES/colors.list``, then ``/etc/edm/colors.list``.
     ``color_def_path`` (``.bob`` inputs only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
-    ``scheme`` (``.bob`` inputs only, for now) is a flattened colour scheme whose imported names
-    become colour roles. The result is stamped ``schema_version`` ``"1.1"`` iff it carries a
+    ``scheme`` (``.edl`` and ``.bob`` inputs) is a flattened colour scheme whose imported names
+    (``import.edm`` / ``import.phoebus``) become colour roles. The result is stamped ``schema_version`` ``"1.1"`` iff it carries a
     role (:func:`pydmconverter.scheme.stamp_schema_version`); it is never validated here.
     """
     suffix = Path(input_path).suffix.lower()
@@ -62,6 +62,7 @@ def convert_to_ir(
             color_list_path=color_list_path,
             calc_list_path=calc_list_path,
             site=site,
+            scheme=scheme,
         )
     elif suffix == ".bob":
         ir = bob_file_to_ir(input_path, registry=registry, color_def_path=color_def_path, scheme=scheme)
