@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Union
 
+from pydmconverter.bob.colors import RGBA, ColorContext, ColorValue, named_color, rgba_to_hex
 from pydmconverter.ir.macros import normalize_macro_syntax
 
 __all__ = [
@@ -35,7 +36,6 @@ __all__ = [
 ]
 
 Number = Union[int, float]
-RGBA = tuple[int, int, int, int]
 
 # Ported from org.phoebus.ui.color.NamedWidgetColors (defineDefaultColors).
 BUILTIN_NAMED_COLORS: dict[str, RGBA] = {
@@ -78,12 +78,6 @@ _VERTICAL_QT: dict[str, str] = {
 def _warn(warnings: list[str] | None, message: str) -> None:
     if warnings is not None:
         warnings.append(message)
-
-
-def rgba_to_hex(rgba: tuple[int, ...]) -> str:
-    """``(r, g, b[, a])`` -> ``"#rrggbb"``, or ``"#rrggbbaa"`` when alpha < 255 (components clamped)."""
-    r, g, b, a = (max(0, min(255, int(c))) for c in (*rgba[:4], 255)[:4])
-    return f"#{r:02x}{g:02x}{b:02x}" if a == 255 else f"#{r:02x}{g:02x}{b:02x}{a:02x}"
 
 
 def _parse_rgba_list(text: str) -> RGBA | None:
@@ -145,6 +139,15 @@ def load_color_def(path: str | Path, warnings: list[str] | None = None) -> dict[
     return named
 
 
+def _table(named: dict[str, RGBA] | None, ctx: ColorContext | None) -> dict[str, RGBA]:
+    """The colour-name table: ``named``, else the context's, else the built-ins."""
+    if named is not None:
+        return named
+    if ctx is not None and ctx.named is not None:
+        return ctx.named
+    return BUILTIN_NAMED_COLORS
+
+
 def _color_elem(elem: ET.Element | None) -> ET.Element | None:
     if elem is None:
         return None
@@ -157,7 +160,8 @@ def color_from_element(
     elem: ET.Element | None,
     named: dict[str, RGBA] | None = None,
     warnings: list[str] | None = None,
-) -> str | None:
+    ctx: ColorContext | None = None,
+) -> ColorValue | None:
     """``<color>`` element (or a property element wrapping one) -> ``"#rrggbb[aa]"``.
 
     A named colour resolves through ``named`` (default: the built-ins), which wins
@@ -165,20 +169,24 @@ def color_from_element(
     name silently uses the saved RGB, as Phoebus does, and warns only when there
     is no saved RGB to fall back on (black). Returns ``None``
     when there is no ``<color>`` element at all.
+
+    With a scheme context ``ctx``, a named colour goes through
+    :func:`~pydmconverter.bob.colors.named_color` and may come back as a role.
     """
     color = _color_elem(elem)
     if color is None:
         return None
-    table = BUILTIN_NAMED_COLORS if named is None else named
+    table = _table(named, ctx)
+    slot = elem.tag if elem is not None and elem.tag != "color" else "color"
     name = color.get("name")
     if name is not None and name in table:
-        return rgba_to_hex(table[name])
+        return named_color(name, table[name], slot, ctx)
     rgb = _rgb_attrs(color)
     if name is not None:
         if rgb is not None:
             # Phoebus saves the RGB beside the name and renders it silently
             # when the name is not in its table; do the same.
-            return rgba_to_hex(rgb)
+            return named_color(name, rgb, slot, ctx)
         _warn(warnings, f"unknown named color '{name}', using {FALLBACK_COLOR}")
         return FALLBACK_COLOR
     if rgb is None:
@@ -203,8 +211,13 @@ def color_from_text(
     text: str,
     named: dict[str, RGBA] | None = None,
     warnings: list[str] | None = None,
-) -> str | None:
-    """``"#rgb"`` / ``"#rrggbb"`` / ``"r,g,b[,a]"`` / colour name -> ``"#rrggbb"``, or ``None``."""
+    ctx: ColorContext | None = None,
+) -> ColorValue | None:
+    """``"#rgb"`` / ``"#rrggbb"`` / ``"r,g,b[,a]"`` / colour name -> ``"#rrggbb"``, or ``None``.
+
+    With a scheme context ``ctx``, a colour name goes through
+    :func:`~pydmconverter.bob.colors.named_color` and may come back as a role.
+    """
     value = text.strip()
     if value.startswith("#"):
         digits = value[1:]
@@ -221,9 +234,9 @@ def color_from_text(
         rgba = _parse_rgba_list(value)
         if rgba is not None:
             return rgba_to_hex(rgba)
-        table = BUILTIN_NAMED_COLORS if named is None else named
+        table = _table(named, ctx)
         if value in table:
-            return rgba_to_hex(table[value])
+            return named_color(value, table[value], "color", ctx)
     _warn(warnings, f"cannot coerce '{text}' to a color")
     return None
 
@@ -287,12 +300,15 @@ def coerce(
     text: str,
     named: dict[str, RGBA] | None = None,
     warnings: list[str] | None = None,
-) -> bool | Number | str | None:
+    *,
+    ctx: ColorContext | None = None,
+) -> bool | Number | str | dict | None:
     """Coerce a property/rule value's text to ``kind`` (``bool``/``number``/``color``/``str``).
 
     ``str`` values get ``$(P)`` -> ``${P}`` macro normalisation. A value that does
     not parse as its kind warns and is returned as the (normalised) text; an
-    unknown kind is treated as ``str`` with a warning.
+    unknown kind is treated as ``str`` with a warning. ``ctx`` (a scheme's
+    :class:`~pydmconverter.bob.colors.ColorContext`) lets a named ``color`` become a role.
     """
     raw = text if isinstance(text, str) else str(text)
     value = raw.strip()
@@ -312,7 +328,7 @@ def coerce(
         except ValueError:
             pass
     elif kind == "color":
-        hexed = color_from_text(value, named, None)
+        hexed = color_from_text(value, named, None, ctx)
         if hexed is not None:
             return hexed
     elif kind == "str":

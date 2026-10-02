@@ -32,6 +32,7 @@ from pydmconverter.bob.bob_qt import (
     rule_coercion,
 )
 from pydmconverter.bob.coercion import RGBA, coerce, color_from_element
+from pydmconverter.bob.colors import ColorContext
 from pydmconverter.bob.parser import BobRule, BobWidget
 from pydmconverter.edm.ir_adapter import _severity_channel
 from pydmconverter.ir.macros import normalize_macro_syntax
@@ -146,11 +147,16 @@ def syntax_check(condition: str) -> bool:
 
 @dataclass
 class RuleContext:
-    """Per-file lowering state: registry, named colours and the collected warnings."""
+    """Per-file lowering state: registry, named colours, the collected warnings and the scheme colour context.
+
+    ``color`` is the document's :class:`~pydmconverter.bob.colors.ColorContext` when a
+    scheme is in force (named colours may then become roles); ``None`` keeps literal hex.
+    """
 
     registry: RegistryClient | None = None
     named_colors: dict[str, RGBA] | None = None
     warnings: list[str] = field(default_factory=list)
+    color: ColorContext | None = None
 
     def warn(self, message: str) -> None:
         """Record a conversion warning."""
@@ -224,9 +230,10 @@ def coerce_value(kind: str, value: Any, ctx: RuleContext, widget: str) -> Any:
     """Coerce a rule arm or static prop value (text or element) to ``kind``."""
     local: list[str] = []
     if isinstance(value, ET.Element):
-        result = color_from_element(value, ctx.named_colors, local) if kind == "color" else value.text or ""
-        if kind != "color":
-            result = coerce(kind, result, ctx.named_colors, local)
+        if kind == "color":
+            result = color_from_element(value, ctx.named_colors, local, ctx.color)
+        else:
+            result = coerce(kind, value.text or "", ctx.named_colors, local, ctx=ctx.color)
     elif isinstance(value, str) and value.lstrip().startswith("<"):
         try:
             element = ET.fromstring(value)
@@ -234,9 +241,9 @@ def coerce_value(kind: str, value: Any, ctx: RuleContext, widget: str) -> Any:
             element = None
         if element is not None:
             return coerce_value(kind, element, ctx, widget)
-        result = coerce(kind, value, ctx.named_colors, local)
+        result = coerce(kind, value, ctx.named_colors, local, ctx=ctx.color)
     elif isinstance(value, str):
-        result = coerce(kind, value, ctx.named_colors, local)
+        result = coerce(kind, value, ctx.named_colors, local, ctx=ctx.color)
     else:
         result = value  # already a Python value (defaults table)
     for message in local:

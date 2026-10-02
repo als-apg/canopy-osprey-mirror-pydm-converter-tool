@@ -52,6 +52,7 @@ from pydmconverter.bob.coercion import (
     points,
     rgba_to_hex,
 )
+from pydmconverter.bob.colors import ColorContext
 from pydmconverter.bob.formula_pv import lower_formula_pv
 from pydmconverter.bob.groups import child_geometry, group_node
 from pydmconverter.bob.local_pv import local_pv_key, plan_declarers, rewrite_local_pv
@@ -65,6 +66,7 @@ from pydmconverter.ir.model import ScreenIR
 from pydmconverter.ir.registry import RegistryClient, VendoredRegistry
 from pydmconverter.ir.source import RuleSpec, SourceNode
 from pydmconverter.ir.transforms import screen_ref
+from pydmconverter.scheme import SchemeResult
 
 __all__ = ["SOURCE_TYPE", "bob_bytes_to_ir", "bob_file_to_ir"]
 
@@ -180,6 +182,7 @@ class _File:
     base_dir: Path | None
     declarer_warnings: dict[str, list[str]] = field(default_factory=dict)
     targets: dict[str, _Target] = field(default_factory=dict)
+    color: ColorContext | None = None
 
 
 # --------------------------------------------------------------------------
@@ -257,7 +260,9 @@ class _WidgetLowering:
         self.geometry = geometry
         self.name = widget.name
         self.warnings: list[str] = []
-        self.rule_ctx = RuleContext(registry=state.registry, named_colors=state.named, warnings=self.warnings)
+        self.rule_ctx = RuleContext(
+            registry=state.registry, named_colors=state.named, warnings=self.warnings, color=state.color
+        )
         self.action_ctx = ActionContext(warnings=self.warnings)
         self.formula_ctx = _FormulaCtx(builder=state.builder, warnings=self.warnings)
         self.declined: list[str] = []
@@ -674,11 +679,13 @@ def _display_to_ir(
     screen_id: str,
     registry: RegistryClient | None,
     color_def_path: str | Path | None,
+    scheme: SchemeResult | None = None,
 ) -> ScreenIR:
     registry = registry or VendoredRegistry()
     builder = IRBuilder(registry)
     file_warnings: list[str] = []
     named = load_color_def(color_def_path, file_warnings) if color_def_path else None
+    color = None if scheme is None else ColorContext.from_scheme(scheme, named or dict(BUILTIN_NAMED_COLORS))
 
     declarer_warnings: list[str] = []
     declarers = plan_declarers(display.widgets, registry, warn=declarer_warnings.append)
@@ -688,6 +695,7 @@ def _display_to_ir(
         named=named,
         script_ctx=ScriptFileContext(writers=build_writer_census(display.widgets)),
         base_dir=display.path.parent if display.path is not None else None,
+        color=color,
     )
     for message in declarer_warnings:
         widget = message.split(": ", 1)[0]
@@ -701,7 +709,12 @@ def _display_to_ir(
     background = None
     bg = display.props.get("background_color")
     if isinstance(bg, ET.Element):
-        background = coerce_value("color", bg, RuleContext(named_colors=named, warnings=file_warnings), "display")
+        background = coerce_value(
+            "color", bg, RuleContext(named_colors=named, warnings=file_warnings, color=color), "display"
+        )
+    # Scheme parity notes are aggregated over the whole document and lead the file warnings.
+    if color is not None:
+        file_warnings[:0] = color.parity_notes()
     # File-level problems (color.def parse errors, the display background) have no
     # widget of their own; they land on the first widget node so none is lost.
     if file_warnings and nodes:
@@ -729,18 +742,23 @@ def bob_file_to_ir(
     *,
     registry: RegistryClient | None = None,
     color_def_path: str | Path | None = None,
+    scheme: SchemeResult | None = None,
 ) -> ScreenIR:
     """Parse a Phoebus ``.bob`` file and build its Screen IR.
 
     ``color_def_path`` names a Phoebus ``color.def`` whose entries overlay the built-in
-    named colours (``<color name="...">``). ``registry`` defaults to the vendored
+    named colours (``<color name="...">``). With a flattened colour ``scheme``, named
+    colours the scheme imports become roles under the parity rule
+    (:func:`~pydmconverter.bob.colors.named_color`); ``None`` keeps today's literal hex. ``registry`` defaults to the vendored
     widget registry. The screen id and title are the file stem. Raises
     :class:`~pydmconverter.bob.parser.BobParseError` on malformed XML; every other
     problem becomes a warning on the node it concerns.
     """
     source = Path(path)
     display = parse_bob(source)
-    return _display_to_ir(display, screen_id=source.stem, registry=registry, color_def_path=color_def_path)
+    return _display_to_ir(
+        display, screen_id=source.stem, registry=registry, color_def_path=color_def_path, scheme=scheme
+    )
 
 
 def bob_bytes_to_ir(
@@ -748,6 +766,7 @@ def bob_bytes_to_ir(
     *,
     registry: RegistryClient | None = None,
     color_def_path: str | Path | None = None,
+    scheme: SchemeResult | None = None,
 ) -> ScreenIR:
     """Build the Screen IR of raw ``.bob`` bytes (an upload with no path on disk).
 
@@ -756,4 +775,4 @@ def bob_bytes_to_ir(
     ``<script file=...>`` cannot be read without a directory and carry their path only.
     """
     display = parse_bob(bytes(data))
-    return _display_to_ir(display, screen_id="screen", registry=registry, color_def_path=color_def_path)
+    return _display_to_ir(display, screen_id="screen", registry=registry, color_def_path=color_def_path, scheme=scheme)

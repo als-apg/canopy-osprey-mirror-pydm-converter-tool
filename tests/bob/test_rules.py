@@ -295,3 +295,57 @@ def test_background_rule_kept_when_transparent_rule_coexists():
     assert spec is not None
     assert spec.conditions == [("{0} == 1", "#ff0000")]
     assert _TRANSPARENT_WARNING not in warnings
+
+
+# --------------------------------------------------------------------------
+# Scheme colour context: rule colour values may become roles
+# --------------------------------------------------------------------------
+def _color_ctx():
+    from pydmconverter.bob.colors import ColorContext
+    from pydmconverter.scheme import SchemeResult
+
+    flat = {"roles": ["MAJOR", "OK"], "light": ["#ff0000", "#24a148"], "dark": ["#ff0000", "#24a148"]}
+    scheme = SchemeResult(flat=flat, imports={"phoebus": {"MAJOR": "MAJOR", "OK": "OK"}}, meta={})
+    return ColorContext.from_scheme(scheme)
+
+
+def test_rule_context_color_defaults_to_none():
+    assert RuleContext().color is None
+    assert RuleContext(registry=_REGISTRY).color is None
+
+
+def test_rule_color_arms_become_roles_with_color_context():
+    widget = _widget(
+        _rule_xml(
+            "foreground_color",
+            ["sim://a"],
+            [
+                ("pv0 > 1", '<color name="MAJOR" red="255" green="0" blue="0"/>'),
+                ("pv0 > 0", '<color name="OK" red="0" green="255" blue="0"/>'),
+            ],
+        )
+    )
+    color = _color_ctx()
+    ctx = RuleContext(registry=_REGISTRY, color=color)
+    spec = lower_rule(widget.rules[0], widget, ctx)
+    values = [value for _cond, value in spec.conditions]
+    # MAJOR's light equals Phoebus red; OK's (#24a148) differs from Phoebus green (#00ff00).
+    assert values == [{"$role": "MAJOR", "fallback": "#ff0000"}, "#00ff00"]
+    notes = color.parity_notes()
+    assert len(notes) == 1 and notes[0].startswith("parity: ") and "'OK'" in notes[0]
+
+
+def test_rule_color_arms_stay_literal_without_color_context():
+    widget = _widget(
+        _rule_xml("foreground_color", ["sim://a"], [("pv0 > 1", '<color name="MAJOR" red="255" green="0" blue="0"/>')])
+    )
+    spec, _warnings = _lower(widget)
+    assert [value for _cond, value in spec.conditions] == ["#ff0000"]
+
+
+def test_coerce_value_passes_color_context_to_text_values():
+    from pydmconverter.bob.rules import coerce_value
+
+    ctx = RuleContext(color=_color_ctx())
+    assert coerce_value("color", "MAJOR", ctx, "W") == {"$role": "MAJOR", "fallback": "#ff0000"}
+    assert coerce_value("color", "MAJOR", RuleContext(), "W") == "#ff0000"
