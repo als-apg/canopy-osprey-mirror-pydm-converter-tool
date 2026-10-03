@@ -81,12 +81,12 @@ def test_survey_counts_a_symlinked_file_once(tmp_path, capsys):
 
 def test_survey_prints_rerooted_header(tmp_path, capsys):
     root = _corpus(tmp_path)
-    shutil.copy(FIXTURES / "survey_b.bob", root / "common" / "embedded" / "_KnobDevice.bob")
-    link = root / "bts" / "embedded" / "_KnobDevice.bob"
+    shutil.copy(FIXTURES / "survey_b.bob", root / "common" / "embedded" / "_SyntheticEmbed.bob")
+    link = root / "bts" / "embedded" / "_SyntheticEmbed.bob"
     link.parent.mkdir()
-    link.symlink_to(scheme_cli.DEPLOYED_PREFIX + "common/embedded/_KnobDevice.bob")
+    link.symlink_to(scheme_cli.DEPLOYED_PREFIX + "common/embedded/_SyntheticEmbed.bob")
     _, out = _run(capsys, "survey", str(root / "bts"), "--corpus-root", str(root))
-    assert "# file: common/embedded/_KnobDevice.bob" in out
+    assert "# file: common/embedded/_SyntheticEmbed.bob" in out
     assert "bts/embedded" not in out
 
 
