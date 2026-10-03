@@ -145,3 +145,38 @@ def test_corpus_rule_equals_manifest_copy(tmp_path):
     assert sorted(f.source for f in items) == expected
     assert PurePosixPath("common/embedded/_K.bob") in [f.rel for f in items]
     assert os.readlink(root / "bts" / "embedded" / "_K.bob").startswith(corpus_manifest.DEPLOYED_PREFIX)
+
+
+# --- fate: slot imports and declared sources ------------------------------------------------------
+
+
+def _fate_ctx():
+    from pydmconverter.bob.colors import ColorContext
+    from pydmconverter.scheme import SchemeResult
+
+    flat = {"roles": ["Grid", "Grid_Fill", "OK"], "light": ["#808080", "#c6c6c6", "#006e00"], "dark": ["#000000"] * 3}
+    imports = {"phoebus": {"Grid": {"role": "Grid", "background_color": "Grid_Fill"}, "OK": "OK"}}
+    return ColorContext.from_scheme(SchemeResult(flat=flat, imports=imports, meta={}, sources={"OK": "#00ff00"}))
+
+
+def test_fate_reports_the_default_role_of_a_slot_import():
+    assert scheme_cli.fate("Grid", (128, 128, 128, 255), _fate_ctx()) == "role Grid"
+
+
+def test_fate_matches_a_declared_source():
+    ctx = _fate_ctx()
+    assert scheme_cli.fate("OK", (0, 255, 0, 255), ctx) == "role OK"
+    assert scheme_cli.fate("OK", (0, 254, 0, 255), ctx) == "literal (role OK phoebus #00ff00 differs)"
+
+
+def test_fate_without_source_compares_light():
+    assert scheme_cli.fate("Grid", (1, 2, 3, 255), _fate_ctx()) == "literal (role Grid light #808080 differs)"
+
+
+def test_survey_with_default_scheme_handles_slot_imports(tmp_path, capsys):
+    root = _corpus(tmp_path)
+    code, out = _run(
+        capsys, "survey", str(root / "bts"), "--corpus-root", str(root), "--scheme", str(DEFAULT_SCHEME_PATH)
+    )
+    assert code == 0
+    assert all(len(r) == 5 for r in _rows(out))

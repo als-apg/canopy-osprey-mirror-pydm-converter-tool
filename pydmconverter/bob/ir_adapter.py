@@ -586,12 +586,23 @@ class _WidgetLowering:
                 pvs.append((pv, trigger))
         return pvs
 
+    def _lower_rule(self, rule: BobRule, registry_id: str | None) -> RuleSpec | None:
+        """Lower ``rule`` with its colour arms slotted on the rule's property (``Grid`` as fill vs line)."""
+        color = self.rule_ctx.color
+        if color is None:
+            return lower_rule(rule, self.widget, self.rule_ctx, registry_id=registry_id)
+        self.rule_ctx.color = color.with_slot(rule.prop_id)
+        try:
+            return lower_rule(rule, self.widget, self.rule_ctx, registry_id=registry_id)
+        finally:
+            self.rule_ctx.color = color
+
     def _rules(self, registry_id: str | None) -> None:
         for rule in self.widget.rules:
             pvs = self._rule_pvs(rule)
             if pvs is None:
                 continue
-            spec = lower_rule(dataclasses.replace(rule, pvs=pvs), self.widget, self.rule_ctx, registry_id=registry_id)
+            spec = self._lower_rule(dataclasses.replace(rule, pvs=pvs), registry_id)
             if spec is None:
                 continue
             if spec.default is None:

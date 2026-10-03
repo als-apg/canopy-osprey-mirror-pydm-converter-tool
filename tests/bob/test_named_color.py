@@ -267,3 +267,218 @@ def test_no_parity_note_when_everything_maps():
     children = _children(to_wire_dict(bob_bytes_to_ir(panel, scheme=_scheme())))
     for child in children:
         assert not [w for w in child.get("warnings", []) if w.startswith("parity: ")]
+
+
+# --------------------------------------------------------------------------
+# C1/C2: slot-aware imports and declared Phoebus source values
+# --------------------------------------------------------------------------
+# Grid splits by use: as a box background it is Grid_Fill (a restyle declaring the Phoebus
+# value it replaces), as a line it stays Grid. OK is a restyle of Phoebus green; Text has no
+# source and keeps the light rule.
+_SLOT_ROLES = {"Grid": "#808080", "Grid_Fill": "#c6c6c6", "OK": "#006e00", "Text": "#000000"}
+_SLOT_SOURCES = {"Grid_Fill": "#808080", "OK": "#00ff00"}
+_SLOT_IMPORTS = {
+    "phoebus": {
+        "Grid": {"role": "Grid", "background_color": "Grid_Fill"},
+        "OK": "OK",
+        "Text": "Text",
+        "Ghost": {"role": "Text", "line_color": "NoSuchRole"},
+    },
+}
+
+
+def _slot_scheme(sources: dict[str, str] | None = None) -> SchemeResult:
+    roles = list(_SLOT_ROLES)
+    flat = {"roles": roles, "light": [_SLOT_ROLES[r] for r in roles], "dark": ["#101010"] * len(roles)}
+    return SchemeResult(
+        flat=flat, imports=_SLOT_IMPORTS, meta={}, sources=_SLOT_SOURCES if sources is None else sources
+    )
+
+
+def _slot_ctx(**kwargs) -> ColorContext:
+    return ColorContext.from_scheme(_slot_scheme(**kwargs), dict(BUILTIN_NAMED_COLORS))
+
+
+_GRAY = (128, 128, 128, 255)
+
+
+def test_from_scheme_copies_sources():
+    ctx = _slot_ctx()
+    assert ctx.sources == _SLOT_SOURCES
+    assert ColorContext.from_scheme(_scheme()).sources == {}
+
+
+def test_role_for_without_slot_is_the_default_role():
+    ctx = _slot_ctx()
+    assert ctx.role_for("Grid") == "Grid"
+    assert ctx.role_for("OK") == "OK"
+
+
+def test_role_for_slot_named_by_the_entry():
+    ctx = _slot_ctx()
+    assert ctx.role_for("Grid", "background_color") == "Grid_Fill"
+    assert ctx.role_for("Grid", "line_color") == "Grid"
+    assert ctx.role_for("Grid", "foreground_color") == "Grid"
+    assert ctx.role_for("OK", "background_color") == "OK"  # string entry: every slot
+
+
+def test_role_for_slot_role_missing_from_scheme_is_none():
+    ctx = _slot_ctx()
+    assert ctx.role_for("Ghost", "line_color") is None
+    assert ctx.role_for("Ghost", "background_color") == "Text"
+
+
+def test_grid_as_background_gives_grid_fill():
+    ctx = _slot_ctx()
+    assert named_color("Grid", _GRAY, "background_color", ctx) == {"$role": "Grid_Fill", "fallback": "#808080"}
+    assert ctx.parity_notes() == []
+
+
+def test_grid_as_line_gives_grid():
+    ctx = _slot_ctx()
+    assert named_color("Grid", _GRAY, "line_color", ctx) == {"$role": "Grid", "fallback": "#808080"}
+    assert ctx.parity_notes() == []
+
+
+def test_restyled_role_emitted_for_its_source_value():
+    ctx = _slot_ctx()
+    # OK's light (#006e00) differs from the screen's #00ff00, but #00ff00 is the declared source.
+    assert named_color("OK", (0, 255, 0, 255), "foreground_color", ctx) == {"$role": "OK", "fallback": "#00ff00"}
+    assert ctx.parity_notes() == []
+
+
+def test_restyled_role_drifted_value_gives_literal_and_note_naming_the_source():
+    ctx = _slot_ctx()
+    assert named_color("OK", (0, 254, 0, 255), "foreground_color", ctx) == "#00fe00"
+    notes = ctx.parity_notes()
+    assert len(notes) == 1
+    note = notes[0]
+    assert note.startswith("parity: ")
+    assert "'OK'" in note and "#00fe00" in note
+    assert "phoebus #00ff00" in note  # the compared value is the source, not the light
+    assert "#006e00" not in note
+
+
+def test_restyled_role_matching_its_light_but_not_its_source_is_literal():
+    ctx = _slot_ctx()
+    assert named_color("OK", (0, 110, 0, 255), "foreground_color", ctx) == "#006e00"
+    assert len(ctx.parity_notes()) == 1
+
+
+def test_source_compare_is_canonical():
+    scheme = _slot_scheme(sources={"OK": "#0F0", "Grid_Fill": "#808080FF"})
+    ctx = ColorContext.from_scheme(scheme)
+    assert named_color("OK", (0, 255, 0, 255), "foreground_color", ctx) == {"$role": "OK", "fallback": "#00ff00"}
+    assert named_color("Grid", _GRAY, "background_color", ctx) == {"$role": "Grid_Fill", "fallback": "#808080"}
+
+
+def test_role_without_source_keeps_the_light_rule():
+    ctx = _slot_ctx()
+    assert named_color("Text", (0, 0, 0, 255), "foreground_color", ctx) == {"$role": "Text", "fallback": "#000000"}
+    assert named_color("Text", (1, 1, 1, 255), "foreground_color", ctx) == "#010101"
+    note = ctx.parity_notes()[0]
+    assert "light #000000" in note
+
+
+def test_without_sources_the_slot_role_uses_its_light():
+    ctx = _slot_ctx(sources={})
+    # Grid_Fill's light #c6c6c6 differs from Phoebus Grid #808080: literal and a note.
+    assert named_color("Grid", _GRAY, "background_color", ctx) == "#808080"
+    assert named_color("OK", (0, 255, 0, 255), "foreground_color", ctx) == "#00ff00"
+    notes = ctx.parity_notes()
+    assert len(notes) == 2
+    assert "'Grid_Fill'" in notes[0] and "light #c6c6c6" in notes[0]
+
+
+def test_slot_mismatch_notes_are_kept_apart_per_role():
+    ctx = _slot_ctx(sources={})
+    named_color("Grid", (1, 2, 3, 255), "background_color", ctx)
+    named_color("Grid", (1, 2, 3, 255), "line_color", ctx)
+    notes = ctx.parity_notes()
+    assert len(notes) == 2
+    assert "'Grid_Fill'" in notes[0] and "background_color" in notes[0]
+    assert "'Grid'" in notes[1] and "line_color" in notes[1]
+
+
+def test_no_scheme_ignores_slots_and_sources():
+    assert named_color("Grid", _GRAY, "background_color", None) == "#808080"
+    assert named_color("OK", (0, 255, 0, 255), "foreground_color", None) == "#00ff00"
+
+
+def test_color_from_element_uses_the_property_tag_as_slot():
+    ctx = _slot_ctx()
+    assert color_from_element(_color("Grid", tag="background_color"), ctx=ctx) == {
+        "$role": "Grid_Fill",
+        "fallback": "#808080",
+    }
+    assert color_from_element(_color("Grid", tag="line_color"), ctx=ctx) == {"$role": "Grid", "fallback": "#808080"}
+
+
+def test_with_slot_names_the_slot_of_a_generic_element_and_shares_parity():
+    ctx = _slot_ctx(sources={})
+    view = ctx.with_slot("background_color")
+    assert view.parity is ctx.parity
+    # A rule arm's <value> element and a bare name do not say which property they colour.
+    value_elem = ET.fromstring('<value><color name="Grid" red="1" green="2" blue="3"/></value>')
+    assert color_from_element(value_elem, ctx=view) == "#808080"
+    assert color_from_text("Grid", ctx=view) == "#808080"
+    notes = ctx.parity_notes()
+    assert len(notes) == 1 and "'Grid_Fill'" in notes[0] and "2 uses: background_color" in notes[0]
+
+
+def test_generic_element_without_slot_hint_keeps_its_tag():
+    ctx = _slot_ctx(sources={})
+    value_elem = ET.fromstring('<value><color name="Grid" red="1" green="2" blue="3"/></value>')
+    # Without a slot hint the <value> wrapper is no property: the import's default role.
+    assert color_from_element(value_elem, ctx=ctx) == {"$role": "Grid", "fallback": "#808080"}
+    assert ctx.parity_notes() == []
+
+
+def _rule_widget(prop: str, color_xml: str) -> str:
+    return (
+        f'<widget type="rectangle" version="2.0.0"><name>R</name>'
+        f'<rules><rule name="r" prop_id="{prop}" out_exp="false">'
+        f'<exp bool_exp="pv0 &gt; 0"><value>{color_xml}</value></exp>'
+        f"<pv_name>sim://x</pv_name></rule></rules></widget>"
+    )
+
+
+def _rule_conditions(panel: bytes, scheme: SchemeResult | None) -> list:
+    children = _children(to_wire_dict(bob_bytes_to_ir(panel, scheme=scheme)))
+    rules = [r for c in children for r in c.get("rules", [])]
+    assert rules, children
+    return [arm[1] if isinstance(arm, list) else arm.get("value") for rule in rules for arm in rule["conditions"]]
+
+
+@pytest.mark.parametrize(
+    ("prop", "role"),
+    [("background_color", "Grid_Fill"), ("line_color", "Grid")],
+)
+def test_rule_arm_uses_the_rule_property_as_slot(prop, role):
+    panel = _panel(_rule_widget(prop, '<color name="Grid" red="128" green="128" blue="128"/>'))
+    assert _rule_conditions(panel, _slot_scheme()) == [{"$role": role, "fallback": "#808080"}]
+
+
+def test_rule_arm_without_scheme_is_literal():
+    panel = _panel(_rule_widget("background_color", '<color name="Grid" red="128" green="128" blue="128"/>'))
+    assert _rule_conditions(panel, None) == ["#808080"]
+
+
+def test_panel_grid_background_and_line_split_by_slot():
+    widget = (
+        '<widget type="rectangle" version="2.0.0"><name>R</name>'
+        '<background_color><color name="Grid" red="128" green="128" blue="128"/></background_color>'
+        '<line_color><color name="Grid" red="128" green="128" blue="128"/></line_color></widget>'
+    )
+    children = _children(to_wire_dict(bob_bytes_to_ir(_panel(widget), scheme=_slot_scheme())))
+    props = children[0]["props"]
+    colors = {v["$role"] for v in props.values() if isinstance(v, dict) and "$role" in v}
+    assert colors == {"Grid_Fill", "Grid"}
+
+
+def test_default_scheme_grid_background_keeps_todays_parity():
+    # canopy-default declares no sources: Grid_Fill's light differs from Phoebus Grid, so literal.
+    ctx = ColorContext.from_scheme(load_scheme(None), dict(BUILTIN_NAMED_COLORS))
+    assert ctx.role_for("Grid", "background_color") == "Grid_Fill"
+    assert named_color("Grid", _GRAY, "background_color", ctx) == "#808080"
+    assert "'Grid_Fill'" in ctx.parity_notes()[0]

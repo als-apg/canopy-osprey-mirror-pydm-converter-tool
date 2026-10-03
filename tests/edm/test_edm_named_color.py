@@ -157,3 +157,32 @@ def test_convert_bytes_edl_passes_scheme(palette, scheme):
     assert widgets[0].props["foregroundColor"] == {"$role": "MAJOR", "fallback": "#da1e28"}
     assert widgets[0].warnings[0].startswith("parity: ")
     assert ir.schema_version == "1.1"
+
+
+# --- C1/C2 are Phoebus-only: EDM output unchanged --------------------------------------------
+
+
+def test_default_scheme_edm_imports_are_plain_roles_without_sources(scheme):
+    assert all(isinstance(role, str) for role in scheme.imports["edm"].values())
+    assert not set(scheme.sources) & set(scheme.imports["edm"].values())
+
+
+def test_phoebus_slot_imports_do_not_change_edm_output(palette, scheme):
+    """Dropping the Phoebus slot objects and sources from the scheme leaves the EDM output identical."""
+    import dataclasses
+
+    phoebus = {name: entry for name, entry in scheme.imports["phoebus"].items() if isinstance(entry, str)}
+    plain = dataclasses.replace(scheme, imports={**scheme.imports, "phoebus": phoebus}, sources={})
+    with_c = react.convert_to_ir(FIXTURE, color_list_path=palette, scheme=scheme)
+    without_c = react.convert_to_ir(FIXTURE, color_list_path=palette, scheme=plain)
+    assert to_json(with_c) == to_json(without_c)
+
+
+def test_edm_ignores_phoebus_sources_of_other_roles(palette, scheme):
+    """A source on a role EDM does not import leaves the EDM output identical."""
+    import dataclasses
+
+    restyled = dataclasses.replace(scheme, sources={"Grid_Fill": "#808080"})
+    assert to_json(react.convert_to_ir(FIXTURE, color_list_path=palette, scheme=restyled)) == to_json(
+        react.convert_to_ir(FIXTURE, color_list_path=palette, scheme=scheme)
+    )

@@ -120,16 +120,20 @@ def _file_colors(source: Path) -> dict[Key, int]:
 
 
 def fate(name: str, rgba: RGBA, ctx: ColorContext | None) -> str:
-    """What a color becomes under the scheme: ``role <name>`` or ``literal`` (with the reason)."""
+    """What a color becomes under the scheme: ``role <name>`` or ``literal`` (with the reason).
+
+    The survey reports the import's default role (no slot); the match is the converter's:
+    the role's ``phoebus`` source when it declares one, else its light value.
+    """
     if ctx is None:
         return NO_SCHEME_FATE
     role = None if name == UNNAMED else ctx.role_for(name)
     if role is None:
         return "literal (not imported)"
-    light = canonical_hex(ctx.light[role])
-    if light == canonical_hex(rgba_to_hex(rgba)):
+    basis, value = ctx.compared_value(role)
+    if value == canonical_hex(rgba_to_hex(rgba)):
         return f"role {role}"
-    return f"literal (role {role} light {light} differs)"
+    return f"literal (role {role} {basis} {value} differs)"
 
 
 def _row(key: Key, count: int, ctx: ColorContext | None) -> str:

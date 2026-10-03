@@ -148,6 +148,10 @@ def _table(named: dict[str, RGBA] | None, ctx: ColorContext | None) -> dict[str,
     return BUILTIN_NAMED_COLORS
 
 
+#: Wrapper tags that do not name the property they colour.
+_GENERIC_SLOTS = frozenset({"color", "value"})
+
+
 def _color_elem(elem: ET.Element | None) -> ET.Element | None:
     if elem is None:
         return None
@@ -171,13 +175,17 @@ def color_from_element(
     when there is no ``<color>`` element at all.
 
     With a scheme context ``ctx``, a named colour goes through
-    :func:`~pydmconverter.bob.colors.named_color` and may come back as a role.
+    :func:`~pydmconverter.bob.colors.named_color` and may come back as a role. The
+    property tag wrapping the ``<color>`` is the slot; a generic wrapper (a rule arm's
+    ``<value>``, a bare ``<color>``) takes ``ctx.slot`` when the caller set one.
     """
     color = _color_elem(elem)
     if color is None:
         return None
     table = _table(named, ctx)
     slot = elem.tag if elem is not None and elem.tag != "color" else "color"
+    if slot in _GENERIC_SLOTS and ctx is not None and ctx.slot is not None:
+        slot = ctx.slot
     name = color.get("name")
     if name is not None and name in table:
         return named_color(name, table[name], slot, ctx)
@@ -216,7 +224,8 @@ def color_from_text(
     """``"#rgb"`` / ``"#rrggbb"`` / ``"r,g,b[,a]"`` / colour name -> ``"#rrggbb"``, or ``None``.
 
     With a scheme context ``ctx``, a colour name goes through
-    :func:`~pydmconverter.bob.colors.named_color` and may come back as a role.
+    :func:`~pydmconverter.bob.colors.named_color` and may come back as a role; its slot
+    is ``ctx.slot`` when the caller set one, else ``"color"``.
     """
     value = text.strip()
     if value.startswith("#"):
@@ -236,7 +245,8 @@ def color_from_text(
             return rgba_to_hex(rgba)
         table = _table(named, ctx)
         if value in table:
-            return named_color(value, table[value], "color", ctx)
+            slot = ctx.slot if ctx is not None and ctx.slot is not None else "color"
+            return named_color(value, table[value], slot, ctx)
     _warn(warnings, f"cannot coerce '{text}' to a color")
     return None
 
