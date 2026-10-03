@@ -5,7 +5,11 @@ validates it against the vendored schema, merges it onto the base per role and p
 references, canonicalises every hex the way the converter writes colors, and returns a :class:`SchemeResult`:
 
 - ``flat``: ``{"roles": [name, ...], "light": [hex, ...], "dark": [hex, ...]}``, parallel lists;
-- ``imports``: ``{"phoebus": {name: role}, "edm": {name: role}}``, the merged import maps;
+- ``imports``: ``{"phoebus": {name: target}, "edm": {name: target}}``, the merged import maps, where a target is a
+  role name or a slot object ``{"role": <default role>, <slot>: <role>, ...}`` choosing the role per source property;
+- ``sources``: ``{role: hex}``, each role's declared ``phoebus`` source color (canonical hex), merged per role like a
+  mode; roles without one are absent. Like ``imports`` it is a converter input, not a column of ``flat``, so it does
+  not enter :meth:`SchemeResult.flat_json` or ``flatHash``;
 - ``meta``: ``{"id", "sha256", "flatHash", "served", "errors": [{"path", "message"}]}``.
 
 Bad input never raises. Every problem found is recorded in ``meta["errors"]``, and when there is any error the
@@ -21,7 +25,7 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +56,12 @@ class SchemeResult:
     """A flattened scheme: the flat role table, the merged import maps and the meta block."""
 
     flat: dict[str, list[str]]
-    imports: dict[str, dict[str, str]]
+    imports: dict[str, dict[str, str | dict[str, str]]]
     meta: dict[str, Any]
+    sources: dict[str, str] = field(default_factory=dict)
 
     def flat_json(self) -> dict[str, Any]:
-        """The flat scheme plus ``meta``, as a fresh JSON-serialisable dict."""
+        """The flat scheme plus ``meta``, as a fresh JSON-serialisable dict. ``imports`` and ``sources`` are not in it."""
         out: dict[str, Any] = copy.deepcopy(self.flat)
         out["meta"] = copy.deepcopy(self.meta)
         return out
@@ -87,40 +92,41 @@ def load_scheme(path: Path | None, *, base_path: Path | None = None) -> SchemeRe
     base_path = Path(base_path) if base_path is not None else DEFAULT_SCHEME_PATH
     base_bytes = base_path.read_bytes()
     base_doc = json.loads(base_bytes.decode("utf-8"))
-    base_roles, base_imports, base_errors = _flatten({}, {}, base_doc, prefix="base:", sort_new=False)
+    base_roles, base_imports, base_sources, base_errors = _flatten({}, {}, {}, base_doc, prefix="base:", sort_new=False)
     base_flat = _to_flat(base_roles)
+    base = (base_flat, base_imports, base_sources)
 
     if path is None:
-        return _result(
-            base_flat, base_imports, DEFAULT_ID, hashlib.sha256(base_bytes).hexdigest(), DEFAULT_ID, base_errors
-        )
+        return _result(*base, DEFAULT_ID, hashlib.sha256(base_bytes).hexdigest(), DEFAULT_ID, base_errors)
 
     path = Path(path)
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        return _fallback(base_flat, base_imports, None, None, [_err("", f"cannot read {path}: {exc.strerror or exc}")])
+        return _fallback(base, None, None, [_err("", f"cannot read {path}: {exc.strerror or exc}")])
     digest = hashlib.sha256(raw).hexdigest()
 
     try:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        return _fallback(base_flat, base_imports, None, digest, [_err("", f"not valid JSON: {exc}")])
+        return _fallback(base, None, digest, [_err("", f"not valid JSON: {exc}")])
 
     errors = _schema_errors(doc)
     scheme_id = doc.get("id") if isinstance(doc, dict) and isinstance(doc.get("id"), str) and doc["id"] else None
     if not isinstance(doc, dict):
-        return _fallback(base_flat, base_imports, scheme_id, digest, errors)
+        return _fallback(base, scheme_id, digest, errors)
 
     base_values = {
         name: {mode: (value, f"base:roles/{name}/{mode}") for mode, value in modes.items()}
         for name, modes in base_roles.items()
     }
-    roles, imports, flatten_errors = _flatten(base_values, base_imports, doc, prefix="", sort_new=True)
+    roles, imports, sources, flatten_errors = _flatten(
+        base_values, base_imports, base_sources, doc, prefix="", sort_new=True
+    )
     errors.extend(flatten_errors)
     if errors:
-        return _fallback(base_flat, base_imports, scheme_id, digest, errors)
-    return _result(_to_flat(roles), imports, scheme_id, digest, scheme_id or DEFAULT_ID, [])
+        return _fallback(base, scheme_id, digest, errors)
+    return _result(_to_flat(roles), imports, sources, scheme_id, digest, scheme_id or DEFAULT_ID, [])
 
 
 #: The SDK's ``ColorRole`` shape (``colorRole.ts``): only these keys, ``$role`` 1-64 UTF-16 units, hex fallbacks.
@@ -169,13 +175,14 @@ def _err(path: str, message: str) -> dict[str, str]:
     return {"path": path, "message": message}
 
 
-def _result(flat, imports, scheme_id, digest, served, errors) -> SchemeResult:
+def _result(flat, imports, sources, scheme_id, digest, served, errors) -> SchemeResult:
     meta = {"id": scheme_id, "sha256": digest, "flatHash": flat_hash(flat), "served": served, "errors": errors}
-    return SchemeResult(flat=copy.deepcopy(flat), imports=copy.deepcopy(imports), meta=meta)
+    return SchemeResult(flat=copy.deepcopy(flat), imports=copy.deepcopy(imports), meta=meta, sources=dict(sources))
 
 
-def _fallback(base_flat, base_imports, scheme_id, digest, errors) -> SchemeResult:
-    return _result(base_flat, base_imports, scheme_id, digest, DEFAULT_ID, errors)
+def _fallback(base, scheme_id, digest, errors) -> SchemeResult:
+    """Serve the base: ``base`` is its ``(flat, imports, sources)``."""
+    return _result(*base, scheme_id, digest, DEFAULT_ID, errors)
 
 
 def _to_flat(roles: dict[str, dict[str, str]]) -> dict[str, list[str]]:
@@ -218,7 +225,7 @@ def _leaf_errors(err) -> list[dict[str, str]]:
             return leaves
     path = "/".join(str(p) for p in err.absolute_path)
     message = err.message
-    if err.validator == "anyOf" and isinstance(err.instance, str):
+    if err.validator == "anyOf" and isinstance(err.instance, str) and path.startswith("roles/"):
         message = f"{err.instance!r} is not a hex color (#rgb, #rrggbb, #rrggbbaa) or an @alias"
     return [_err(path, message)]
 
@@ -234,15 +241,17 @@ def _parse_color(value: Any) -> Any:
     return _INVALID
 
 
-def _flatten(base_values, base_imports, doc, *, prefix: str, sort_new: bool):
+def _flatten(base_values, base_imports, base_sources, doc, *, prefix: str, sort_new: bool):
     """Merge ``doc`` onto the base, resolve aliases and check imports.
 
-    ``base_values`` maps role -> mode -> (value, origin path). Returns (roles, imports, errors) where roles maps each
-    fully resolved role to ``{"light": hex, "dark": hex}``; roles that failed to resolve are left out. New roles
-    keep file order for the base itself and are sorted by name for a facility file (so key order cannot matter).
+    ``base_values`` maps role -> mode -> (value, origin path); ``base_sources`` maps role -> phoebus hex. Returns
+    (roles, imports, sources, errors) where roles maps each fully resolved role to ``{"light": hex, "dark": hex}``;
+    roles that failed to resolve are left out, and so are their sources. New roles keep file order for the base
+    itself and are sorted by name for a facility file (so key order cannot matter).
     """
     errors: list[dict[str, str]] = []
     merged: dict[str, dict[str, tuple[Any, str]]] = {name: dict(modes) for name, modes in base_values.items()}
+    merged_sources: dict[str, str] = dict(base_sources)
 
     doc_roles = doc.get("roles") if isinstance(doc, dict) else None
     if not isinstance(doc_roles, dict):
@@ -257,6 +266,15 @@ def _flatten(base_values, base_imports, doc, *, prefix: str, sort_new: bool):
             for mode in MODES:
                 if mode in value:
                     merged[name][mode] = (_parse_color(value[mode]), f"{prefix}roles/{name}/{mode}")
+            if "phoebus" in value:
+                source = value["phoebus"]
+                if isinstance(source, str) and _HEX.match(source):
+                    merged_sources[name] = canonical_hex(source)
+                else:
+                    # The schema reports a facility file's bad source; the base file is not schema-checked.
+                    if prefix:
+                        errors.append(_err(f"{prefix}roles/{name}/phoebus", f"{source!r} is not a hex color"))
+                    merged_sources.pop(name, None)
         else:
             parsed = _parse_color(value)
             for mode in MODES:
@@ -277,8 +295,9 @@ def _flatten(base_values, base_imports, doc, *, prefix: str, sort_new: bool):
             if value is not None:
                 resolved[name][mode] = value
     roles = {name: modes for name, modes in resolved.items() if len(modes) == len(MODES)}
+    sources = {name: merged_sources[name] for name in roles if name in merged_sources}
 
-    imports: dict[str, dict[str, str]] = {kind: dict(base_imports.get(kind, {})) for kind in IMPORT_KINDS}
+    imports: dict[str, dict[str, Any]] = {kind: dict(base_imports.get(kind, {})) for kind in IMPORT_KINDS}
     doc_imports = doc.get("import") if isinstance(doc, dict) else None
     if isinstance(doc_imports, dict):
         for kind in IMPORT_KINDS:
@@ -288,13 +307,21 @@ def _flatten(base_values, base_imports, doc, *, prefix: str, sort_new: bool):
             for key, target in mapping.items():
                 if target is None:
                     imports[kind].pop(key, None)
-                elif isinstance(target, str):
-                    imports[kind][key] = target
+                elif isinstance(target, (str, dict)):
+                    imports[kind][key] = copy.deepcopy(target)  # replaces the inherited entry whole
     for kind in IMPORT_KINDS:
         for key, target in imports[kind].items():
-            if target not in merged:
+            if isinstance(target, dict):
+                if "role" not in target:
+                    errors.append(_err(f"{prefix}import/{kind}/{key}/role", "slot import has no default 'role'"))
+                for slot, slot_role in target.items():
+                    if not isinstance(slot_role, str) or slot_role not in merged:
+                        errors.append(
+                            _err(f"{prefix}import/{kind}/{key}/{slot}", f"import target {slot_role!r} is not a role")
+                        )
+            elif target not in merged:
                 errors.append(_err(f"{prefix}import/{kind}/{key}", f"import target {target!r} is not a role"))
-    return roles, imports, errors
+    return roles, imports, sources, errors
 
 
 def _resolve(name, mode, merged, errors, reported_cycles) -> str | None:

@@ -8,7 +8,7 @@ import pytest
 
 from pydmconverter.scheme import DEFAULT_SCHEME_PATH, SchemeResult, load_scheme
 
-PACKAGED_SHA256 = "36e765dc007f378c468baa41173cee4973a123c16e936e30b5becf9e187b4683"
+PACKAGED_SHA256 = "f05a3580268d2fa2673665a257deb13803f3a5a265da998f851b852960f82bea"
 DEFAULT = json.loads(DEFAULT_SCHEME_PATH.read_text(encoding="utf-8"))
 DEFAULT_ROLES = list(DEFAULT["roles"])
 
@@ -357,3 +357,183 @@ def test_flat_hash_changes_with_content(tmp_path):
 
 def test_flat_hash_is_deterministic_across_calls():
     assert load_scheme(None).meta["flatHash"] == load_scheme(None).meta["flatHash"]
+
+
+# -- role sources (phoebus) ------------------------------------------------------------------------------------------
+
+#: flatHash of the vendored canopy-default; sources are not a flat column, so they must never move it.
+DEFAULT_FLAT_HASH = "8a449d518604ade529912d55b2a1668352fbee691730ce87010215eee0452c91"
+
+
+def test_default_has_no_sources_and_flat_is_unchanged_by_sources():
+    result = load_scheme(None)
+    assert result.sources == {}
+    assert result.meta["flatHash"] == DEFAULT_FLAT_HASH
+    out = result.flat_json()
+    assert set(out) == {"roles", "light", "dark", "meta"}
+    assert "phoebus" not in out and "sources" not in out
+
+
+def test_source_is_collected_and_canonicalised(tmp_path):
+    doc = {
+        "id": "fac",
+        "roles": {"OK": {"phoebus": "#ABC"}, "Mine": {"light": "#010203", "dark": "#040506", "phoebus": "#0A0B0CFF"}},
+    }
+    result = load_scheme(write(tmp_path, doc))
+    assert result.meta["errors"] == []
+    assert result.sources == {"OK": "#aabbcc", "Mine": "#0a0b0c"}
+    # A role carrying only a phoebus value keeps its inherited colours.
+    assert role(result, "OK") == (DEFAULT["roles"]["OK"]["light"], DEFAULT["roles"]["OK"]["dark"])
+
+
+def test_sources_do_not_change_flat_or_flat_hash(tmp_path):
+    plain = load_scheme(write(tmp_path, {"id": "fac", "roles": {"OK": "#123456"}}, "a.json"))
+    sourced = load_scheme(
+        write(
+            tmp_path,
+            {"id": "fac", "roles": {"OK": {"light": "#123456", "dark": "#123456", "phoebus": "#00ff00"}}},
+            "b.json",
+        )
+    )
+    assert sourced.sources == {"OK": "#00ff00"}
+    assert plain.flat == sourced.flat
+    assert plain.meta["flatHash"] == sourced.meta["flatHash"]
+    assert {k: v for k, v in plain.flat_json().items() if k != "meta"} == {
+        k: v for k, v in sourced.flat_json().items() if k != "meta"
+    }
+
+
+def test_facility_source_overrides_base_source(tmp_path):
+    base = write(
+        tmp_path,
+        {
+            "id": "canopy-default",
+            "roles": {"A": {"light": "#111111", "dark": "#222222", "phoebus": "#333333"}, "B": "#444444"},
+        },
+        "base.json",
+    )
+    assert load_scheme(None, base_path=base).sources == {"A": "#333333"}
+    fac = write(tmp_path, {"id": "fac", "roles": {"A": {"phoebus": "#FFF"}}})
+    result = load_scheme(fac, base_path=base)
+    assert result.meta["errors"] == []
+    assert result.sources == {"A": "#ffffff"}
+    # A facility value that omits phoebus inherits the base source, like an omitted mode.
+    kept = load_scheme(
+        write(tmp_path, {"id": "fac", "roles": {"A": {"light": "#000000"}}}, "kept.json"), base_path=base
+    )
+    assert kept.sources == {"A": "#333333"}
+    # A string value sets both modes but carries no source, so it inherits too.
+    stringy = load_scheme(write(tmp_path, {"id": "fac", "roles": {"A": "#000000"}}, "s.json"), base_path=base)
+    assert stringy.sources == {"A": "#333333"}
+
+
+def test_source_on_unknown_role_is_an_error(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "roles": {"Ghost": {"phoebus": "#123456"}}}))
+    paths = error_paths(result)
+    assert "roles/Ghost/light" in paths and "roles/Ghost/dark" in paths
+    assert_serves_default(result)
+    assert result.sources == {}
+
+
+def test_bad_source_hex_is_an_error(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "roles": {"OK": {"phoebus": "@MAJOR"}}}))
+    assert "roles/OK/phoebus" in error_paths(result)
+    assert_serves_default(result)
+    assert result.sources == {}
+
+
+def test_fallback_serves_base_sources(tmp_path):
+    base = write(
+        tmp_path,
+        {"id": "canopy-default", "roles": {"A": {"light": "#111111", "dark": "#222222", "phoebus": "#333333"}}},
+        "base.json",
+    )
+    result = load_scheme(write(tmp_path, "{not json"), base_path=base)
+    assert result.meta["served"] == "canopy-default"
+    assert result.sources == {"A": "#333333"}
+
+
+def test_sources_are_a_copy(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "roles": {"OK": {"phoebus": "#123456"}}}))
+    result.sources["OK"] = "#000000"
+    again = load_scheme(write(tmp_path, {"id": "fac", "roles": {"OK": {"phoebus": "#123456"}}}, "b.json"))
+    assert again.sources == {"OK": "#123456"}
+
+
+# -- slot imports ----------------------------------------------------------------------------------------------------
+
+
+def test_default_keeps_the_grid_slot_import():
+    result = load_scheme(None)
+    assert result.meta["errors"] == []
+    assert result.imports["phoebus"]["Grid"] == {"role": "Grid", "background_color": "Grid_Fill"}
+    assert result.imports == DEFAULT["import"]
+
+
+def test_slot_object_is_merged_and_validated(tmp_path):
+    doc = {
+        "id": "fac",
+        "import": {"phoebus": {"OK": {"role": "OK", "line_color": "MAJOR", "background_color": "MINOR"}}},
+    }
+    result = load_scheme(write(tmp_path, doc))
+    assert result.meta["errors"] == []
+    assert result.imports["phoebus"]["OK"] == {"role": "OK", "line_color": "MAJOR", "background_color": "MINOR"}
+    assert result.imports["phoebus"]["STOP"] == "STOP"
+
+
+def test_bad_slot_target_reports_its_path(tmp_path):
+    doc = {"id": "fac", "import": {"phoebus": {"OK": {"role": "OK", "background_color": "NoSuchRole"}}}}
+    result = load_scheme(write(tmp_path, doc))
+    assert "import/phoebus/OK/background_color" in error_paths(result)
+    assert_serves_default(result)
+
+
+def test_bad_default_slot_role_reports_role_path(tmp_path):
+    doc = {"id": "fac", "import": {"edm": {"x": {"role": "Nope", "line_color": "OK"}}}}
+    result = load_scheme(write(tmp_path, doc))
+    assert error_paths(result) == ["import/edm/x/role"]
+    assert_serves_default(result)
+
+
+def test_slot_object_without_role_is_a_schema_error(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "import": {"phoebus": {"OK": {"line_color": "OK"}}}}))
+    assert result.meta["errors"]
+    assert_serves_default(result)
+
+
+def test_string_replaces_inherited_slot_object(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "import": {"phoebus": {"Grid": "Grid_Fill"}}}))
+    assert result.meta["errors"] == []
+    assert result.imports["phoebus"]["Grid"] == "Grid_Fill"
+
+
+def test_slot_object_replaces_inherited_string_and_object_whole(tmp_path):
+    doc = {"id": "fac", "import": {"phoebus": {"OK": {"role": "MINOR"}, "Grid": {"role": "Grid", "line_color": "OK"}}}}
+    result = load_scheme(write(tmp_path, doc))
+    assert result.meta["errors"] == []
+    assert result.imports["phoebus"]["OK"] == {"role": "MINOR"}
+    # Replaced whole: the inherited background_color slot does not survive.
+    assert result.imports["phoebus"]["Grid"] == {"role": "Grid", "line_color": "OK"}
+
+
+def test_null_deletes_an_inherited_slot_object(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "import": {"phoebus": {"Grid": None}}}))
+    assert result.meta["errors"] == []
+    assert "Grid" not in result.imports["phoebus"]
+
+
+def test_slot_import_may_target_new_facility_role(tmp_path):
+    doc = {
+        "id": "fac",
+        "roles": {"Mine": "#010203"},
+        "import": {"phoebus": {"Grid": {"role": "Grid", "background_color": "Mine"}}},
+    }
+    result = load_scheme(write(tmp_path, doc))
+    assert result.meta["errors"] == []
+    assert result.imports["phoebus"]["Grid"]["background_color"] == "Mine"
+
+
+def test_imports_are_a_deep_copy(tmp_path):
+    result = load_scheme(None)
+    result.imports["phoebus"]["Grid"]["role"] = "OK"
+    assert load_scheme(None).imports["phoebus"]["Grid"]["role"] == "Grid"

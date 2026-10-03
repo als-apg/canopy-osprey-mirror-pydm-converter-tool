@@ -41,16 +41,30 @@
           "additionalProperties": false,
           "properties": {
             "light": { "$ref": "#/$defs/Color" },
-            "dark": { "$ref": "#/$defs/Color" }
+            "dark": { "$ref": "#/$defs/Color" },
+            "phoebus": {
+              "description": "The Phoebus color this role restyles: on import the role is emitted iff the screen color equals this value.",
+              "$ref": "#/$defs/Hex"
+            }
           }
         }
       ]
     },
     "ImportMap": {
-      "description": "Maps a source color name to a role name; null deletes an inherited mapping.",
+      "description": "Maps a source color name to a role name, or to a slot object choosing the role per source property; null deletes an inherited mapping.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/Name" },
-      "additionalProperties": { "anyOf": [{ "$ref": "#/$defs/Name" }, { "type": "null" }] }
+      "additionalProperties": {
+        "anyOf": [{ "$ref": "#/$defs/Name" }, { "type": "null" }, { "$ref": "#/$defs/SlotImport" }]
+      }
+    },
+    "SlotImport": {
+      "description": "A slot-aware import: 'role' is the default role; every other key is a source property name (e.g. background_color) mapped to the role used for that property.",
+      "type": "object",
+      "required": ["role"],
+      "properties": { "role": { "$ref": "#/$defs/Name" } },
+      "propertyNames": { "$ref": "#/$defs/Name" },
+      "additionalProperties": { "$ref": "#/$defs/Name" }
     }
   }
 }

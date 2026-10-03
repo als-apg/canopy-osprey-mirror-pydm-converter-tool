@@ -18,8 +18,8 @@ from pydmconverter.ir.model import SchemaVersion, ScreenIR
 
 PINNED = {
     "screen-ir.schema.json": "e9a2cbd3bf620b12c97da9941af4dd9db061bf088d25ed1c1bcdfcffd7c10e4c",
-    "canopy-color-scheme-1.schema.json": "be4f4b9a14714cab955173546dc868f078da4f7b1867a7482a6f582456d8c2c3",
-    "schemes/canopy-default.json": "36e765dc007f378c468baa41173cee4973a123c16e936e30b5becf9e187b4683",
+    "canopy-color-scheme-1.schema.json": "94b2e2cb5c0ee1854ebe2b806ba2c52213f9ef2d218cb11a1be49bde3562c2b2",
+    "schemes/canopy-default.json": "f05a3580268d2fa2673665a257deb13803f3a5a265da998f851b852960f82bea",
 }
 REGISTRY_DIGEST = "5a721981b55042091a3329626a5fb62f327685a8e91989dd164c3c816983147b"
 
