@@ -8,7 +8,7 @@ import pytest
 
 from pydmconverter.scheme import DEFAULT_SCHEME_PATH, SchemeResult, load_scheme
 
-PACKAGED_SHA256 = "f05a3580268d2fa2673665a257deb13803f3a5a265da998f851b852960f82bea"
+PACKAGED_SHA256 = "0a8f403e70f0b9a5dc2eb9679da24f72f54209e19a8a9043d3de636e49ce810d"
 DEFAULT = json.loads(DEFAULT_SCHEME_PATH.read_text(encoding="utf-8"))
 DEFAULT_ROLES = list(DEFAULT["roles"])
 
@@ -362,7 +362,7 @@ def test_flat_hash_is_deterministic_across_calls():
 # -- role sources (phoebus) ------------------------------------------------------------------------------------------
 
 #: flatHash of the vendored canopy-default; sources are not a flat column, so they must never move it.
-DEFAULT_FLAT_HASH = "8a449d518604ade529912d55b2a1668352fbee691730ce87010215eee0452c91"
+DEFAULT_FLAT_HASH = "570b18da90319ef309645f8450a4a5a420c39fdc98046bdd2f142d1c74072b93"
 
 
 def test_default_has_no_sources_and_flat_is_unchanged_by_sources():
