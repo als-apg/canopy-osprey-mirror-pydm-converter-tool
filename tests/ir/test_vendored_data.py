@@ -21,7 +21,7 @@ PINNED = {
     "canopy-color-scheme-1.schema.json": "94b2e2cb5c0ee1854ebe2b806ba2c52213f9ef2d218cb11a1be49bde3562c2b2",
     "schemes/canopy-default.json": "0a8f403e70f0b9a5dc2eb9679da24f72f54209e19a8a9043d3de636e49ce810d",
 }
-REGISTRY_DIGEST = "5a721981b55042091a3329626a5fb62f327685a8e91989dd164c3c816983147b"
+REGISTRY_DIGEST = "2b6d747019371cd688ed3ac0f33e1e82b8eb329764cca35e7be226a7e9e7ee86"
 
 
 def data_dir():

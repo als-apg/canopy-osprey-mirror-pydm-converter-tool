@@ -29,7 +29,7 @@ source repo. Sources are repo-relative (`<repo>: <path>`).
 | `screen-ir.schema.json` | `canopy-sdk-js: packages/screen-ir/schema/screen-ir.schema.json` | `e9a2cbd3bf620b12c97da9941af4dd9db061bf088d25ed1c1bcdfcffd7c10e4c` |
 | `canopy-color-scheme-1.schema.json` | `canopy-sdk-js: packages/screen-ir/schema/canopy-color-scheme-1.schema.json` | `94b2e2cb5c0ee1854ebe2b806ba2c52213f9ef2d218cb11a1be49bde3562c2b2` |
 | `schemes/canopy-default.json` | `canopy: src/canopy/converter/data/schemes/canopy-default.json` | `0a8f403e70f0b9a5dc2eb9679da24f72f54209e19a8a9043d3de636e49ce810d` |
-| `widget-registry/*.json` | `canopy: widget-registry-data/widgets` | `5a721981b55042091a3329626a5fb62f327685a8e91989dd164c3c816983147b` |
+| `widget-registry/*.json` | `canopy: widget-registry-data/widgets` | `2b6d747019371cd688ed3ac0f33e1e82b8eb329764cca35e7be226a7e9e7ee86` |
 
 The widget-registry digest covers the whole directory: it is the sha256 of the
 `shasum -a 256 *.json` listing taken inside `widget-registry/` (one
