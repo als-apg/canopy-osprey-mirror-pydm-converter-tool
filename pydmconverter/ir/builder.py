@@ -16,11 +16,20 @@ unknown-widget fallback, screen metadata, and macro collection.
 
 from __future__ import annotations
 
+import logging
+import re
+from dataclasses import replace
 from typing import Any
 
 from pydmconverter.ir.fox import parse_calc_url
 from pydmconverter.ir.ids import FormulaPool, IdAllocator
-from pydmconverter.ir.macros import find_macro_references
+from pydmconverter.ir.macros import (
+    LITERAL_BRACE,
+    LITERAL_REF_RE,
+    MACRO_REF_RE,
+    find_macro_references,
+    valid_macro_name,
+)
 from pydmconverter.ir.model import (
     Geometry,
     MacroDeclaration,
@@ -35,8 +44,15 @@ from pydmconverter.ir.model import (
     WidgetNode,
 )
 from pydmconverter.ir.registry import RegistryClient, WidgetDefinition
-from pydmconverter.ir.source import RuleSpec, SourceNode
+from pydmconverter.ir.source import RuleSpec, SourceNode, conversion_failure
 from pydmconverter.ir.transforms import DROP, apply_transform
+
+logger = logging.getLogger(__name__)
+
+# A macro-dict key a target screen could reference as ``${KEY}`` (MACRO_REF_RE's
+# charset). Other keys (e.g. a stray ``2 "P`` from a mis-split symbols line) can
+# never match a reference, so renaming them would only add noise.
+_REFERABLE_KEY_RE = re.compile(r"\w+")
 
 ROOT_CANVAS_TYPE = "absolute-canvas"
 UNKNOWN_WIDGET_TYPE = "unknown-widget"
@@ -58,16 +74,38 @@ class IRBuilder:
         screen_id: str,
         title: str,
         source_type: str,
-        size: tuple[Number, Number],
+        size: tuple[Number | None, Number | None],
         top_level: list[SourceNode],
         macros: list[MacroDeclaration] | None = None,
         background: str | None = None,
+        grow_to_fit: bool = True,
+        warnings: list[str] | None = None,
         macro_defaults: dict[str, str] | None = None,
+        literal_braces: bool = True,
     ) -> ScreenIR:
         """Assemble a screen: an ``absolute-canvas`` root wrapping the top-level nodes.
 
         If ``macros`` is not supplied, declare every ``${VAR}`` referenced in props
         (default ``""``), so the screen is self-consistent (macros design M2/M9).
+
+        Canvas size: with ``grow_to_fit`` (the default; PyDM ``.ui`` windows
+        auto-grow/scroll) the canvas expands to the children's extent + an 8 px
+        margin rather than clip them. With ``grow_to_fit=False`` (EDM: the window is
+        exactly the declared w x h and clips; hidden objects are parked far
+        off-screen on purpose) the declared size is kept, off-canvas widgets stay in
+        the IR (the runtime clips them), and one root warning counts the widgets
+        lying entirely outside the canvas. A ``None`` dimension (the source declares
+        none) is always derived from the content extent + margin.
+
+        ``warnings`` are screen-level notes. The IR has no screen-level warnings
+        field, so they ride on the root canvas node, where consumers that walk the
+        node warnings (the Canopy conversion API) surface them.
+
+        A literal ``${VAR}`` that a front-end marked with
+        :data:`~pydmconverter.ir.macros.LITERAL_BRACE` is neither declared nor
+        renamed, and is written back as ``${VAR}``. A front-end that wrote no
+        marker passes ``literal_braces=False`` to skip that pass.
+
         ``macro_defaults`` (e.g. a display's ``<macros>`` block) then overlays its
         values onto those declarations and appends any macro it names that nothing
         references. Defaults are stored verbatim, even when they contain ``${OTHER}``
@@ -77,14 +115,20 @@ class IRBuilder:
         # Allocate the root id before children so the canvas stays w-001.
         root_id = self.ids.widget()
         children = [self._build_node(node) for node in top_level]
-        # PyDM windows auto-grow/scroll, so children can extend past the root
-        # rect; expand the canvas to encompass them rather than clip.
+        root_warnings = list(warnings or [])
         MARGIN = 8
-        max_x, max_y = self._content_extent(children)
-        if max_x + MARGIN > width:
+        max_x, max_y = self._content_extent(children, (width, height))
+        if width is None or (grow_to_fit and max_x + MARGIN > width):
             width = max_x + MARGIN
-        if max_y + MARGIN > height:
+        if height is None or (grow_to_fit and max_y + MARGIN > height):
             height = max_y + MARGIN
+        if not grow_to_fit:
+            outside = self._count_outside(children, width, height)
+            if outside:
+                root_warnings.append(
+                    f"{outside} widget(s) lie entirely outside the {width}x{height} canvas; "
+                    "kept in the IR, clipped at runtime"
+                )
         root_props: dict = {"width": width, "height": height}
         if background:
             # The legacy display's field color; the renderer paints the canvas
@@ -96,13 +140,28 @@ class IRBuilder:
             props=root_props,
             geometry=Geometry(x=0, y=0, width=width, height=height),
             children=children,
+            warnings=root_warnings,
         )
+        renamed, collisions = self._rename_invalid_macros(root)
+        if renamed:
+            pairs = ", ".join(f"{old} -> {new}" for old, new in sorted(renamed.items()))
+            root.warnings.append(f"Macro names the IR rejects were renamed (callers must pass the new name): {pairs}")
+        if collisions:
+            merged = "; ".join(f"{', '.join(olds)} -> {new}" for new, olds in sorted(collisions.items()))
+            root.warnings.append(f"Renamed macros collide with other macro names and now share one value: {merged}")
         if macros is not None:
             declared = macros
         else:
             declared = self._collect_macros(root)
             if macro_defaults:
                 declared = self._overlay_macro_defaults(declared, macro_defaults)
+        literal = self._restore_literal_braces(root) if literal_braces else set()
+        shared = sorted(literal & {macro.name for macro in declared})
+        if shared:
+            root.warnings.append(
+                "Literal ${NAME} text (not a macro in the source, e.g. a shell variable) shares its name "
+                f"with a macro, so the runtime substitutes the macro's value into it: {', '.join(shared)}"
+            )
         return ScreenIR(
             id=screen_id,
             kind="screen",
@@ -117,6 +176,18 @@ class IRBuilder:
         )
 
     def _build_node(self, node: SourceNode) -> WidgetNode:
+        """Build one node; a node that fails to build becomes an ``unknown-widget``
+        placeholder (with a warning) instead of aborting the whole screen."""
+        if node.placeholder_reason is None:
+            try:
+                return self._build_resolved(node)
+            except Exception as exc:  # noqa: BLE001 - one bad widget must not abort the screen
+                logger.warning("Building %s failed; emitting a placeholder", node.original_class, exc_info=True)
+                # Rules may be what failed; the placeholder does without them.
+                node = replace(node, rules=[], placeholder_reason=conversion_failure(node.original_class, exc))
+        return self._unknown_node(node)
+
+    def _build_resolved(self, node: SourceNode) -> WidgetNode:
         definition = self.registry.by_id(node.registry_id) if node.registry_id else None
         if definition is None and node.qt_class:
             definition = self.registry.by_qt_class(node.qt_class)
@@ -176,7 +247,7 @@ class IRBuilder:
         """A D11 placeholder — nothing disappears silently."""
         original = node.original_class
         warnings = list(node.warnings)
-        warnings.append(f"No registry entry for {original}; rendering placeholder")
+        warnings.append(node.placeholder_reason or f"No registry entry for {original}; rendering placeholder")
         return WidgetNode(
             id=self.ids.widget(),
             type=UNKNOWN_WIDGET_TYPE,
@@ -220,22 +291,46 @@ class IRBuilder:
         return name
 
     @staticmethod
-    def _content_extent(nodes: list[WidgetNode]) -> tuple[Number, Number]:
-        """Max (x+width, y+height) over a node tree, ignoring zero-size nodes."""
+    def _content_extent(nodes: list[WidgetNode], page: tuple[Number, Number]) -> tuple[Number, Number]:
+        """Max (x+width, y+height) over a node tree, ignoring zero-size nodes.
+
+        A top-level node whose rect is exactly the page ``(0, 0, *page)`` is a page
+        wrapper (e.g. a .ui ``centralwidget``), not content: only its children count.
+        """
         max_x = max_y = 0
 
-        def visit(node: WidgetNode) -> None:
+        def visit(node: WidgetNode, top: bool = False) -> None:
             nonlocal max_x, max_y
             g = node.geometry
-            if g.width and g.height:
+            wrapper = top and (g.x, g.y, g.width, g.height) == (0, 0, *page)
+            if g.width and g.height and not wrapper:
                 max_x = max(max_x, g.x + g.width)
                 max_y = max(max_y, g.y + g.height)
             for child in node.children:
                 visit(child)
 
         for n in nodes:
-            visit(n)
+            visit(n, top=True)
         return max_x, max_y
+
+    @staticmethod
+    def _count_outside(nodes: list[WidgetNode], width: Number, height: Number) -> int:
+        """Leaf widgets (any depth) with a nonzero size lying entirely outside ``width x height``."""
+        count = 0
+
+        def visit(node: WidgetNode) -> None:
+            nonlocal count
+            if node.children:
+                for child in node.children:
+                    visit(child)
+                return
+            g = node.geometry
+            if g.width and g.height and (g.x >= width or g.y >= height or g.x + g.width <= 0 or g.y + g.height <= 0):
+                count += 1
+
+        for n in nodes:
+            visit(n)
+        return count
 
     @staticmethod
     def _geometry(geom: tuple[Number, Number, Number, Number]) -> Geometry:
@@ -254,6 +349,112 @@ class IRBuilder:
             MacroDeclaration(name=name, default=value) for name, value in defaults.items() if name not in referenced
         )
         return overlaid
+
+    def _rename_invalid_macros(self, root: WidgetNode) -> tuple[dict[str, str], dict[str, list[str]]]:
+        """Rename macros whose names the IR rejects (``${6X6FBCKPV}``), consistently.
+
+        Rewrites every ``${NAME}`` reference (props, recursively; rule PVs,
+        expressions, values and defaults; formula expressions and bindings) and every
+        referable key of a ``macros`` prop (what a related/embedded display passes to
+        its target) with :func:`~pydmconverter.ir.macros.valid_macro_name`. The mapping
+        is deterministic, so a caller and its converted target agree on the new
+        name. Returns ``{old: new}`` for the names that changed, and the collisions:
+        ``{new: [names]}`` for each new name that several distinct names now share
+        (another renamed name, or a valid name the screen already uses, e.g.
+        ``${6X}`` and ``${M_6X}``) — they would silently resolve to one value.
+        """
+        renamed: dict[str, str] = {}
+        seen: set[str] = set()
+
+        def rename(name: str) -> str:
+            seen.add(name)
+            new = valid_macro_name(name)
+            if new != name:
+                renamed[name] = new
+            return new
+
+        def fix(value: Any, prop: str | None = None) -> Any:
+            if isinstance(value, str):
+                if "${" not in value:
+                    return value
+                return MACRO_REF_RE.sub(lambda m: "${" + rename(m.group(1)) + "}", value)
+            if isinstance(value, list):
+                return [fix(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    (
+                        rename(key)
+                        if prop == "macros" and isinstance(key, str) and _REFERABLE_KEY_RE.fullmatch(key)
+                        else key
+                    ): fix(item)
+                    for key, item in value.items()
+                }
+            return value
+
+        def visit(node: WidgetNode) -> None:
+            node.props = {key: fix(value, key) for key, value in node.props.items()}
+            for rule in node.rules:
+                for pv in rule.pvs:
+                    pv.name = fix(pv.name)
+                for condition in rule.conditions:
+                    condition.expression = fix(condition.expression)
+                    condition.value = fix(condition.value)
+                rule.default = fix(rule.default)
+            for child in node.children:
+                visit(child)
+
+        visit(root)
+        for formula in self.formulas.declarations:
+            formula.expression = fix(formula.expression)
+            formula.bindings = {key: fix(binding) for key, binding in formula.bindings.items()}
+        sharing: dict[str, set[str]] = {}
+        for old, new in renamed.items():
+            sharing.setdefault(new, set()).add(old)
+        for new, olds in sharing.items():
+            if new in seen:  # a valid name used as is (a renamed one never maps to itself)
+                olds.add(new)
+        collisions = {new: sorted(olds) for new, olds in sharing.items() if len(olds) > 1}
+        return renamed, collisions
+
+    def _restore_literal_braces(self, root: WidgetNode) -> set[str]:
+        """Turn :data:`~pydmconverter.ir.macros.LITERAL_BRACE` back into ``{`` in
+        every string (props, recursively; rules; warnings; formulas). Returns the
+        names of the literal ``${NAME}`` refs it restored."""
+        names: set[str] = set()
+
+        def fix(value: Any) -> Any:
+            if isinstance(value, str):
+                if LITERAL_BRACE not in value:
+                    return value
+                names.update(LITERAL_REF_RE.findall(value))
+                return value.replace(LITERAL_BRACE, "{")
+            if isinstance(value, list):
+                return [fix(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(fix(item) for item in value)
+            if isinstance(value, dict):
+                return {fix(key): fix(item) for key, item in value.items()}
+            return value
+
+        def visit(node: WidgetNode) -> None:
+            node.props = fix(node.props)
+            node.warnings = fix(node.warnings)
+            for rule in node.rules:
+                rule.name = fix(rule.name)
+                for pv in rule.pvs:
+                    pv.name = fix(pv.name)
+                for condition in rule.conditions:
+                    condition.expression = fix(condition.expression)
+                    condition.value = fix(condition.value)
+                rule.default = fix(rule.default)
+            for child in node.children:
+                visit(child)
+
+        visit(root)
+        for formula in self.formulas.declarations:
+            formula.expression = fix(formula.expression)
+            formula.bindings = fix(formula.bindings)
+        return names
 
     def _collect_macros(self, root: WidgetNode) -> list[MacroDeclaration]:
         """Declare every ``${VAR}`` referenced in any string prop, default ``""``.

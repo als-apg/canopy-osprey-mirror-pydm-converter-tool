@@ -46,7 +46,7 @@ class SourceNode:
         Qt/PyDM class to resolve against the registry (``"PyDMLabel"``). ``None``
         for a node with no widget mapping (forces an ``unknown-widget``).
     qt_props:
-        Prop values keyed by Qt property name (the keys Beaver's ``qtPropMap``
+        Prop values keyed by Qt property name (the keys the registry's ``qtPropMap``
         expects). The builder selects and transforms these.
     registry_id:
         Direct registry id to resolve (bypasses Qt-class lookup) — for source
@@ -70,6 +70,9 @@ class SourceNode:
         Source prop names the front-end discarded (neither mapped nor used), in
         source order. Carried onto the IR node's ``dropped_props`` (never emitted)
         so a conversion loss is visible instead of silent.
+    placeholder_reason:
+        When set, the builder emits an ``unknown-widget`` placeholder with this
+        warning instead of resolving the node (a front-end failed to convert it).
     """
 
     qt_class: str | None
@@ -83,7 +86,19 @@ class SourceNode:
     warnings: list[str] = field(default_factory=list)
     meta: NodeMeta | None = None
     dropped_props: list[str] = field(default_factory=list)
+    placeholder_reason: str | None = None
 
     @property
     def original_class(self) -> str | None:
         return self.raw_class or self.qt_class
+
+
+def exception_detail(exc: BaseException) -> str:
+    """The first line of ``exc``'s message, capped at 200 characters ("" when it has none)."""
+    message = str(exc).strip()
+    return message.splitlines()[0][:200] if message else ""
+
+
+def conversion_failure(source_class: str | None, exc: BaseException) -> str:
+    """The placeholder warning for a widget whose conversion raised ``exc``."""
+    return f"Conversion of {source_class} failed ({type(exc).__name__}: {exception_detail(exc)}); rendering placeholder"

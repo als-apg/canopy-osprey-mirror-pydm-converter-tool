@@ -304,6 +304,71 @@ def test_font_pixelsize_used_verbatim(tmp_path):
     assert ir.root.children[0].props["fontSize"] == 15
 
 
+def test_button_text_double_ampersand_unescaped(tmp_path):
+    """Issue #157: the .ui emitter writes `&&` for button text so Qt doesn't treat
+    a lone `&` as a mnemonic marker; the react/IR path has no mnemonic concept and
+    must show the user's literal `&` (button text lands in IR as `label`)."""
+    ui = tmp_path / "button.ui"
+    ui.write_text(
+        """<?xml version="1.0"?>
+<ui version="4.0"><class>Form</class>
+<widget class="QWidget" name="centralwidget">
+ <property name="geometry"><rect><x>0</x><y>0</y><width>200</width><height>100</height></rect></property>
+ <widget class="PyDMRelatedDisplayButton" name="btn">
+  <property name="geometry"><rect><x>0</x><y>0</y><width>150</width><height>30</height></rect></property>
+  <property name="text"><string>PLC &amp;&amp; UPS Diagnostics</string></property>
+  <property name="filenames"><stringlist><string>plc.ui</string></stringlist></property>
+ </widget>
+</widget></ui>"""
+    )
+    ir = ui_file_to_ir(ui)
+    button = ir.root.children[0]
+    assert button.props["label"] == "PLC & UPS Diagnostics"
+
+
+def test_related_display_titles_unescaped():
+    """`titles` (plural) isn't in related-display-button's qtPropMap, so it never
+    surfaces into IR props (builder._map_props drops anything not in qtPropMap) —
+    but the SourceNode-level unescaping must still happen (defense in depth /
+    future-proofing), so assert directly on the SourceNode qt_props."""
+    import xml.etree.ElementTree as ET
+
+    from pydmconverter.ui.ir_adapter import _widget_to_sources
+
+    widget_xml = """<widget class="PyDMRelatedDisplayButton" name="btn">
+      <property name="geometry"><rect><x>0</x><y>0</y><width>150</width><height>30</height></rect></property>
+      <property name="titles"><stringlist><string>Sub &amp;&amp; Menu</string></stringlist></property>
+    </widget>"""
+    widget = ET.fromstring(widget_xml)
+    nodes = _widget_to_sources(widget, None)
+    assert nodes[0].qt_props["titles"] == ["Sub & Menu"]
+
+
+def test_label_text_ampersand_untouched(tmp_path):
+    """Regression guard: QLabel/PyDMLabel text is never unescaped (PyQt5 renders
+    `&` in a QLabel literally, so there is no mnemonic to undo)."""
+    ui = tmp_path / "label_amp.ui"
+    ui.write_text(
+        """<?xml version="1.0"?>
+<ui version="4.0"><class>Form</class>
+<widget class="QWidget" name="centralwidget">
+ <property name="geometry"><rect><x>0</x><y>0</y><width>200</width><height>100</height></rect></property>
+ <widget class="PyDMLabel" name="lbl_dbl">
+  <property name="geometry"><rect><x>0</x><y>0</y><width>80</width><height>20</height></rect></property>
+  <property name="text"><string>A &amp;&amp; B</string></property>
+ </widget>
+ <widget class="PyDMLabel" name="lbl_single">
+  <property name="geometry"><rect><x>0</x><y>30</y><width>80</width><height>20</height></rect></property>
+  <property name="text"><string>A &amp; B</string></property>
+ </widget>
+</widget></ui>"""
+    )
+    ir = ui_file_to_ir(ui)
+    lbl_dbl, lbl_single = ir.root.children[0], ir.root.children[1]
+    assert lbl_dbl.props["text"] == "A && B"
+    assert lbl_single.props["text"] == "A & B"
+
+
 def test_font_without_size_emits_nothing(tmp_path):
     """A <font> with no point/pixel size must not add a bogus fontSize prop
     (runtime default stands) and must never crash the conversion."""
@@ -324,3 +389,144 @@ def test_font_without_size_emits_nothing(tmp_path):
     )
     ir = ui_file_to_ir(ui)
     assert "fontSize" not in ir.root.children[0].props
+
+
+def _centralwidget_ui(tmp_path, central: tuple[int, int], label: tuple[int, int, int, int]):
+    """A legacy-converter-shaped .ui: a 400x300 Form wrapping a layout-less
+    centralwidget with an explicit geometry and one label."""
+    x, y, w, h = label
+    ui = tmp_path / "central.ui"
+    ui.write_text(
+        f"""<?xml version="1.0"?>
+<ui version="4.0"><class>Form</class>
+<widget class="QWidget" name="Form">
+ <property name="geometry"><rect><x>0</x><y>0</y><width>400</width><height>300</height></rect></property>
+ <widget class="QWidget" name="centralwidget">
+  <property name="geometry"><rect><x>0</x><y>0</y><width>{central[0]}</width><height>{central[1]}</height></rect></property>
+  <widget class="QLabel" name="lbl">
+   <property name="geometry"><rect><x>{x}</x><y>{y}</y><width>{w}</width><height>{h}</height></rect></property>
+   <property name="text"><string>hi</string></property>
+  </widget>
+ </widget>
+</widget></ui>"""
+    )
+    return ui_file_to_ir(ui)
+
+
+def test_centralwidget_geometry_keeps_screen_size(tmp_path):
+    """A centralwidget sized to the screen is a page wrapper, not content: it must
+    not push the canvas out by the overflow margin (400x300 stays 400x300)."""
+    ir = _centralwidget_ui(tmp_path, (400, 300), (20, 20, 100, 20))
+    assert (ir.metadata.size.width, ir.metadata.size.height) == (400, 300)
+    assert (ir.root.geometry.width, ir.root.geometry.height) == (400, 300)
+
+
+def test_centralwidget_overflow_still_grows_screen(tmp_path):
+    """Children past the declared size (centralwidget enlarged to cover them) still
+    grow the canvas to their extent plus the margin."""
+    ir = _centralwidget_ui(tmp_path, (450, 340), (300, 300, 150, 40))
+    assert (ir.metadata.size.width, ir.metadata.size.height) == (458, 348)
+    assert (ir.root.geometry.width, ir.root.geometry.height) == (458, 348)
+
+
+def _related_display_ui(tmp_path, macros_xml):
+    ui = tmp_path / "rd.ui"
+    ui.write_text(
+        f"""<?xml version="1.0"?>
+<ui version="4.0"><class>Form</class>
+<widget class="QWidget" name="Form">
+ <property name="geometry"><rect><x>0</x><y>0</y><width>200</width><height>100</height></rect></property>
+ <widget class="PyDMRelatedDisplayButton" name="rd">
+  <property name="geometry"><rect><x>0</x><y>0</y><width>100</width><height>20</height></rect></property>
+  <property name="filenames" stdset="0"><stringlist><string>a.ui</string><string>b.ui</string></stringlist></property>
+  {macros_xml}
+ </widget>
+</widget></ui>"""
+    )
+    (button,) = ui_file_to_ir(ui).root.children
+    return button
+
+
+def test_related_display_macros_stringlist_takes_first_display(tmp_path):
+    """macros is a QStringList paired with filenames: the IR button (first file only) gets entry 0 as an object."""
+    button = _related_display_ui(
+        tmp_path,
+        """<property name="macros" stdset="0"><stringlist>
+  <string>{"P": "A"}</string><string>{"P": "B"}</string></stringlist></property>""",
+    )
+    assert button.props["file"] == "a.screen.json"
+    assert button.props["macros"] == {"P": "A"}
+
+
+def test_related_display_macros_string_and_epics_forms(tmp_path):
+    """A lone <string> (older single-entry form) in PyDM's NAME=value syntax also becomes an object."""
+    button = _related_display_ui(tmp_path, '<property name="macros" stdset="0"><string>P=A, R=B</string></property>')
+    assert button.props["macros"] == {"P": "A", "R": "B"}
+
+
+def test_related_display_empty_first_macros_dropped(tmp_path):
+    button = _related_display_ui(
+        tmp_path,
+        """<property name="macros" stdset="0"><stringlist>
+  <string>{}</string><string>{"P": "B"}</string></stringlist></property>""",
+    )
+    assert "macros" not in button.props
+
+
+def test_related_display_unparseable_macros_dropped_with_warning(tmp_path):
+    button = _related_display_ui(tmp_path, '<property name="macros" stdset="0"><string>not macros</string></property>')
+    assert "macros" not in button.props
+    assert "rd has unparseable macros; dropped" in button.warnings
+
+
+def test_related_display_macros_newline_joined_string_takes_first_line(tmp_path):
+    """A lone <string> may be the pre-#181 converter's newline-joined list (one JSON object per filename)."""
+    button = _related_display_ui(
+        tmp_path, '<property name="macros" stdset="0"><string>{"P": "A"}\n{"P": "B"}</string></property>'
+    )
+    assert button.props["macros"] == {"P": "A"}
+    assert not any("unparseable macros" in warning for warning in button.warnings)
+
+
+def test_related_display_newline_joined_empty_first_entry(tmp_path):
+    button = _related_display_ui(
+        tmp_path, '<property name="macros" stdset="0"><string>{}\n{"P": "B"}</string></property>'
+    )
+    assert "macros" not in button.props
+    assert not any("unparseable macros" in warning for warning in button.warnings)
+
+
+def test_related_display_pretty_printed_macros_string(tmp_path):
+    """A multi-line <string> that is one JSON object parses whole, before any first-line split."""
+    button = _related_display_ui(
+        tmp_path, '<property name="macros" stdset="0"><string>{\n "P": "A"\n}</string></property>'
+    )
+    assert button.props["macros"] == {"P": "A"}
+
+
+def test_shell_command_only_names_default_to_themselves(tmp_path):
+    """A ${NAME} only shell commands use is a shell variable to PyDM unless a macro
+    is passed (an EDM $\\{NAME\\} converts to this). The default "" would blank it,
+    so it defaults to its own ${NAME}; a name used elsewhere is a macro."""
+    ui = tmp_path / "shell.ui"
+    ui.write_text(
+        """<?xml version="1.0"?>
+<ui version="4.0"><class>Form</class>
+<widget class="QWidget" name="Form">
+ <property name="geometry"><rect><x>0</x><y>0</y><width>200</width><height>100</height></rect></property>
+ <widget class="PyDMShellCommand" name="cmd">
+  <property name="geometry"><rect><x>0</x><y>0</y><width>100</width><height>20</height></rect></property>
+  <property name="commands" stdset="0"><stringlist><string>echo ${HOME} ${P}</string></stringlist></property>
+ </widget>
+ <widget class="QLabel" name="label">
+  <property name="geometry"><rect><x>0</x><y>30</y><width>100</width><height>20</height></rect></property>
+  <property name="text"><string>${P}</string></property>
+ </widget>
+</widget></ui>"""
+    )
+    screen = ui_file_to_ir(ui)
+    assert [(m.name, m.default) for m in screen.macros] == [("HOME", "${HOME}"), ("P", "")]
+    shell, _ = screen.root.children
+    assert shell.props["command"] == "echo ${HOME} ${P}"
+    assert not shell.warnings and not screen.root.warnings
+    validate_screen_json(to_wire_dict(screen))

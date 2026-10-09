@@ -1,13 +1,80 @@
 import os
 import re
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Any
 from pydmconverter.custom_types import RGBA
 
 logger = logging.getLogger(__name__)
 
+SearchPaths = Optional[Union[str, "os.PathLike[str]", Sequence[Union[str, "os.PathLike[str]"]]]]
 
-def search_calc_list(file_path: str, cli_calc_file: Optional[str] = None) -> Optional[str]:
+
+def normalize_search_paths(search_paths: SearchPaths) -> List[str]:
+    """
+    Normalize extra search directories into a list of path strings.
+
+    A lone path (str or os.PathLike) is accepted as well as a sequence of paths,
+    so a plain string is not split into its characters. Empty entries are dropped,
+    as in an EDMDATAFILES split, so ``""`` never stands for the current directory;
+    a caller who wants the CWD searched passes ``"."``.
+
+    Parameters
+    ----------
+    search_paths : str | os.PathLike | Sequence[str | os.PathLike], optional
+        A single directory, a sequence of directories, or None.
+
+    Returns
+    -------
+    List[str]
+        The non-empty directories as strings, in order; empty when search_paths is
+        None.
+    """
+    if search_paths is None:
+        return []
+    if isinstance(search_paths, (str, os.PathLike)):
+        search_paths = [search_paths]
+    return [path for path in map(os.fspath, search_paths) if path]
+
+
+def resolve_inside(base: Union[str, "os.PathLike[str]"], name: str, allowed_roots: Sequence[Path]) -> Optional[Path]:
+    """
+    Resolve a file name taken from an untrusted input, confined to allowed roots.
+
+    The check looks only at the path, never at whether the file exists, so a
+    rejection says nothing about the filesystem outside the roots.
+
+    Parameters
+    ----------
+    base : str | os.PathLike
+        Directory the name is relative to.
+    name : str
+        The file name as written in the input.
+    allowed_roots : Sequence[Path]
+        Already-resolved directories the result must lie inside (any one of them).
+
+    Returns
+    -------
+    Path | None
+        ``(base / name).resolve()``, or None when ``name`` is absolute (any anchor,
+        which also covers Windows drive and root forms), cannot be resolved (e.g. a
+        NUL byte or a symlink loop), or resolves outside every allowed root (``..``,
+        or a symlink pointing elsewhere).
+    """
+    if Path(name).anchor:
+        return None
+    try:
+        candidate = (Path(base) / name).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if any(candidate.is_relative_to(root) for root in allowed_roots):
+        return candidate
+    return None
+
+
+def search_calc_list(
+    file_path: str, cli_calc_file: Optional[str] = None, search_paths: SearchPaths = None
+) -> Optional[str]:
     """
     Search for a calc.list file and return its full path, returns None if no calc.list is found.
 
@@ -16,7 +83,9 @@ def search_calc_list(file_path: str, cli_calc_file: Optional[str] = None) -> Opt
     1. cli_calc_file, if provided.
     2. calc.list in the same directory as file_path.
     3. calc.list in a config subdirectory next to file_path.
-    4. $EDMFILES/calc.list.
+    4. calc.list (then config/calc.list) in each of search_paths, in order.
+    5. $EDMFILES/calc.list.
+    6. calc.list beside $EDMCOLORFILE.
 
     Parameters
     ----------
@@ -25,6 +94,10 @@ def search_calc_list(file_path: str, cli_calc_file: Optional[str] = None) -> Opt
     cli_calc_file : str, optional
         An explicit path to a calc.list file (e.g. from the --calc-list CLI
         option). If provided and valid, it overrides the other locations.
+    search_paths : str | os.PathLike | Sequence[str | os.PathLike], optional
+        Extra directories to search (a single path or a sequence of paths), e.g.
+        the directory an uploaded screen came from when the file itself was
+        staged elsewhere.
 
     Returns
     -------
@@ -39,6 +112,9 @@ def search_calc_list(file_path: str, cli_calc_file: Optional[str] = None) -> Opt
         os.path.join(directory, "calc.list"),
         os.path.join(directory, "config", "calc.list"),
     ]
+    for search_dir in normalize_search_paths(search_paths):
+        candidates.append(os.path.join(search_dir, "calc.list"))
+        candidates.append(os.path.join(search_dir, "config", "calc.list"))
 
     edmfiles = os.environ.get("EDMFILES", "")
     if edmfiles:
@@ -451,6 +527,9 @@ def loc_conversion(edm_string: str) -> str:
 
     Enum ('e') is mapped to int for simplicity in this conversion.
 
+    A value with no recognized type prefix (e.g. "CMOS:LI20:3490") becomes a
+    str PV holding the whole text, whereas EDM drops its first two characters.
+
     Parameters
     ----------
     edm_string : str
@@ -560,9 +639,16 @@ def loc_conversion(edm_string: str) -> str:
         # logger.warning(f"Unsupported type character: {type_char}")
         # return f"No loc here"
         if edm_type and len(edm_type) > 1:
+            # No type prefix, e.g. LOC\DISP=CMOS:LI20:3490. EDM's default case
+            # makes a string PV but still drops a type char and separator, so
+            # it stores "OS:LI20:3490". Keep the whole text instead: it is the
+            # author's value, and int readers like menuMux see 0 either way.
             edm_type = "s"
+            pydm_type = type_mapping[edm_type]
             value = type_and_value
-            logger.warning(f"Unexpected type_and_value: {type_and_value}")
+            logger.warning(
+                f"Local PV '{name}' has no recognized type in '{type_and_value}', using it as a string value"
+            )
         else:
             raise ValueError(f"Unsupported type character: {type_char}")
 
@@ -585,8 +671,20 @@ def loc_conversion(edm_string: str) -> str:
     return pydm_string
 
 
+def loc_str_init(url: str) -> str:
+    """Initial value of a str loc:// URL as loc_conversion writes it; "" for any other channel."""
+    if not url.startswith("loc://") or not re.search(r"[?&]type=str(&|$)", url):
+        return ""
+    match = re.search(r"[?&]init=([^&]*)", url)
+    return match.group(1) if match else ""
+
+
 def replace_calc_and_loc_in_edm_content(
-    edm_content: str, filepath: str, calc_list_file: Optional[str] = None, calc_reuse_short: bool = True
+    edm_content: str,
+    filepath: str,
+    calc_list_file: Optional[str] = None,
+    calc_reuse_short: bool = True,
+    search_paths: SearchPaths = None,
 ) -> Tuple[str, Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
     """
     Replace both CALC\\...(...) and LOC\\...=... references in the EDM file content
@@ -607,6 +705,9 @@ def replace_calc_and_loc_in_edm_content(
         use the short ``calc://<id>`` form (the plugin reuses the registered
         config). The react/IR target passes False: every appearance carries the
         full query so the formula hoister can lower each one independently.
+    search_paths : str | os.PathLike | Sequence[str | os.PathLike], optional
+        Extra directories (a single path or a sequence of paths) searched for
+        calc.list (see :func:`search_calc_list`).
 
     Returns
     -------
@@ -619,7 +720,7 @@ def replace_calc_and_loc_in_edm_content(
         A dictionary of all encountered LOC references, similarly mapping each
         unique original LOC reference to "full" and "short" addresses.
     """
-    calc_list_path = search_calc_list(filepath, calc_list_file)
+    calc_list_path = search_calc_list(filepath, calc_list_file, search_paths)
     calc_dict = parse_calc_list(calc_list_path)
 
     encountered_calcs: Dict[str, Dict[str, str]] = {}
@@ -716,6 +817,124 @@ def search_color_list(cli_color_file=None) -> str | None:
         return default_path
 
     return None
+
+
+# EDM colors.list tokenizer (color_pkg.cc getToken): a quoted string, a run of
+# the special characters < > = | & !, or a word ended by whitespace, a comma, a
+# quote, a special character or "#". ":" is not special, so "30 :" and ':"red"'
+# yield a standalone ":" token.
+_RULE_TOKEN_RE = re.compile(r'"([^"]*)"|([<>=|&!]+)|([^\s,"<>=|&!#]+)')
+# EDM rule operators -> the comparison they apply to the PV value (the value is
+# the left operand: "< 4" means value < 4, color_pkg.cc lessThan(variable, arg)).
+RULE_OPERATORS = {"=": "==", "!=": "!=", ">": ">", ">=": ">=", "<": "<", "<=": "<="}
+RULE_CONNECTORS = ("&&", "||")
+
+
+def _strip_color_comment(line: str) -> str:
+    """Drop a trailing ``# comment`` (a ``#`` outside double quotes)."""
+    in_quote = False
+    for pos, char in enumerate(line):
+        if char == '"':
+            in_quote = not in_quote
+        elif char == "#" and not in_quote:
+            return line[:pos]
+    return line
+
+
+def _rule_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    for match in _RULE_TOKEN_RE.finditer(text):
+        quoted, special, word = match.groups()
+        if quoted is not None:
+            tokens.append(quoted)
+        elif special:
+            tokens.append(special)
+        elif word.endswith(":") and word != ":":
+            # "30:" is one token to EDM (and an illegal float); be lenient.
+            tokens.extend([word[:-1], ":"])
+        else:
+            tokens.append(word)
+    return tokens
+
+
+def _rule_number(token: str) -> Optional[float]:
+    try:
+        return float(token)
+    except ValueError:
+        try:
+            return float(int(token, 0))
+        except ValueError:
+            return None
+
+
+def parse_color_rule_condition(text: str) -> Optional[Dict[str, Any]]:
+    """Parse one colors.list rule condition line, EDM grammar (color_pkg.cc ver4InitFromFile).
+
+    ``[op] number [(&& | ||) [op] number] : result`` or ``default : result``; a
+    bare number implies ``=``. ``result`` is a static colour name, or ``&&``/``||``
+    to join this condition with the next one (no colour of its own).
+
+    Returns a dict with ``condition`` (the text before the colon), ``color`` (the
+    result colour name, ``None`` for a join), ``default`` (always true), ``terms``
+    (``[(python_op, value)]``, one or two), ``connector`` (``"&&"``/``"||"`` between
+    the two terms, or ``None``) and ``join`` (``"&&"``/``"||"``/``None``), or
+    ``None`` when the line does not follow the grammar.
+    """
+    condition_text, sep, _ = text.partition(":")
+    tokens = _rule_tokens(text)
+    if not sep or not tokens:
+        return None
+    parsed: Dict[str, Any] = {
+        "condition": condition_text.strip(),
+        "color": None,
+        "default": False,
+        "terms": [],
+        "connector": None,
+        "join": None,
+    }
+    pos = 0
+
+    def term() -> bool:
+        nonlocal pos
+        if pos >= len(tokens):
+            return False
+        token = tokens[pos]
+        op = "="
+        if token in RULE_OPERATORS:
+            op = token
+            pos += 1
+            if pos >= len(tokens):
+                return False
+            token = tokens[pos]
+        value = _rule_number(token)
+        if value is None:
+            return False
+        parsed["terms"].append((RULE_OPERATORS[op], value))
+        pos += 1
+        return True
+
+    if tokens[0] == "default":
+        parsed["default"] = True
+        pos = 1
+    else:
+        if not term():
+            return None
+        if pos < len(tokens) and tokens[pos] in RULE_CONNECTORS:
+            parsed["connector"] = tokens[pos]
+            pos += 1
+            if not term():
+                return None
+    if pos >= len(tokens) or tokens[pos] != ":":
+        return None
+    pos += 1
+    if pos >= len(tokens):
+        return None
+    result = tokens[pos]
+    if result in RULE_CONNECTORS:
+        parsed["join"] = result
+    else:
+        parsed["color"] = result
+    return parsed
 
 
 def parse_colors_list(filepath: str) -> Dict[str, Any]:
@@ -896,25 +1115,20 @@ def parse_colors_list(filepath: str) -> Dict[str, Any]:
                 idx = skip_blanks_and_comments(idx)
 
             while idx < len(lines):
-                inner_line = lines[idx].strip()
+                inner_line = _strip_color_comment(lines[idx]).strip()
                 idx += 1
                 if not inner_line or re_comment.match(inner_line):
                     continue
                 if inner_line.startswith("}"):
                     break
 
-                parts = inner_line.split(":")
-                if len(parts) == 2:
-                    condition_str = parts[0].strip()
-                    color_str = parts[1].strip().strip('"')
-                    conditions.append(
-                        {
-                            "condition": condition_str,
-                            "color": color_str,
-                        }
-                    )
+                condition = parse_color_rule_condition(inner_line)
+                if condition is None:
+                    logger.warning(f"Unparseable condition in colors.list rule {rule_index}: '{inner_line}'")
+                    continue
+                conditions.append(condition)
 
-            parsed_data["rules"][rule_index] = {"name": rule_name_part, "conditions": conditions}
+            parsed_data["rules"][rule_index] = {"name": rule_name_part.strip('"'), "conditions": conditions}
             continue
 
         if line.startswith("menumap"):
@@ -939,11 +1153,11 @@ def parse_colors_list(filepath: str) -> Dict[str, Any]:
                     break
                 if not inner_line or re_comment.match(inner_line):
                     continue
-                alarm_parts = inner_line.split(":")
-                if len(alarm_parts) == 2:
-                    alarm_state = alarm_parts[0].strip()
-                    color_name = alarm_parts[1].strip().strip('"')
-                    parsed_data["alarm"][alarm_state] = color_name
+                # Split on the FIRST colon only: colour names carry colons of
+                # their own ("Monitor: MINOR").
+                alarm_state, sep, color_name = inner_line.partition(":")
+                if sep:
+                    parsed_data["alarm"][alarm_state.strip()] = color_name.strip().strip('"')
             continue
 
         logging.warning(f"Unrecognized line in colors.list: '{line}'")
@@ -974,9 +1188,43 @@ def get_color_by_index(color_data: Dict[str, Any], index: str) -> Optional[Dict[
         idx = int(match.group(1))
         color = color_data.get("static", {}).get(idx)
         if not color:
+            color = rule_static_color(color_data, idx)
+        if not color:
             logger.warning(f"Color index {idx} not found in colors.list.")
         return color
     logger.warning(f"Invalid color index format: '{index}'.")
+    return None
+
+
+def static_color_by_name(color_data: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    """The static colour called ``name`` (EDM resolves rule results by name, statics only)."""
+    for color in (color_data or {}).get("static", {}).values():
+        if color.get("name") == name:
+            return color
+    return None
+
+
+def rule_static_color(color_data: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+    """The colour a rule index shows when no condition applies, or ``None``.
+
+    EDM gives a rule colour the pixel of its FIRST condition that names a result
+    colour (color_pkg.cc, "use first rule condition as static color for rule"),
+    and ``evalRule`` returns the rule index itself when nothing matches — so that
+    colour is both the static rendering and the no-match fallback. The returned
+    dict is the static entry's (``rgb`` may carry six components for a blinking
+    colour) plus ``rule``: the rule index.
+    """
+    rule = (color_data or {}).get("rules", {}).get(idx)
+    if not rule:
+        return None
+    for condition in rule.get("conditions", ()):
+        name = condition.get("color")
+        if name:
+            static = static_color_by_name(color_data, name)
+            if static is None:
+                logger.warning(f"colors.list rule {idx} names unknown colour '{name}'.")
+                return None
+            return {**static, "rule": idx}
     return None
 
 

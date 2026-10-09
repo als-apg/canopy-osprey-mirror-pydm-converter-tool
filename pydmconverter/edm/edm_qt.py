@@ -1,7 +1,7 @@
 """EDM -> Qt class and prop name maps for the IR adapter.
 
 The shared IR builder resolves widgets and props by Qt vocabulary (the keys
-Beaver's ``qtMapping``/``qtPropMap`` use). The EDM front-end therefore translates
+the registry's ``qtMapping``/``qtPropMap`` use). The EDM front-end therefore translates
 EDM class names -> Qt class names and EDM attribute names -> Qt prop names here;
 value coercion lives in ``ir_adapter.py``.
 
@@ -21,6 +21,8 @@ EDM_TO_QT_CLASS: dict[str, str] = {
     "multilinetextupdateclass": "PyDMLabel",
     "activexregtextclass": "PyDMLabel",
     "regtextupdateclass": "PyDMLabel",
+    # Text Control: an input only when "editable" is set; read-only ones resolve to
+    # PyDMLabel (resolve_qt_class).
     "activextextdspclass": "PyDMLineEdit",
     "textentryclass": "PyDMLineEdit",
     "activebuttonclass": "PyDMPushButton",
@@ -76,10 +78,10 @@ EDM_READBACK_CHANNEL_ORDER = ("indicatorPv", "readPv")
 # widget's channel (nor make a static label "live" — see has_pv).
 EDM_CHANNEL_ATTRS = EDM_PRIMARY_CHANNEL_ORDER + ("alarmPv",)
 
-# EDM attribute name -> Qt prop name (the key Beaver's qtPropMap consumes).
+# EDM attribute name -> Qt prop name (the key the registry's qtPropMap consumes).
 # Channel attrs are absent on purpose: the adapter routes them itself.
 EDM_TO_QT_PROP: dict[str, str] = {
-    # text / labels (Beaver maps "text" -> text/label per widget)
+    # text / labels (the registry maps "text" -> text/label per widget)
     "value": "text",
     "label": "text",
     "buttonLabel": "text",
@@ -159,12 +161,20 @@ def resolve_qt_class(name_lower: str, properties: dict[str, Any]) -> str | None:
     ``QLabel`` (-> ``text-label``, which has a ``text`` prop). With a PV it is a live
     value display, so it maps to ``PyDMLabel`` (-> ``pv-label``).
 
+    ``activeXTextDspClass`` is read-only unless its ``editable`` flag is set (EDM
+    ``x_text_dsp_obj.cc`` loads it with a default of 0 and refuses input when it is
+    clear), so only an editable one maps to ``PyDMLineEdit`` (-> ``pv-text-input``);
+    otherwise it is a value display, ``PyDMLabel`` (-> ``pv-label``), like
+    ``activeXTextDspClass:noedit`` and ``TextupdateClass``.
+
     A closed or filled ``activeLineClass`` is a polygon, not a polyline — the
     polyline widget has no fill, so EDM's filled shapes (triangles, flow arrows)
     rendered as empty outlines.
     """
     if name_lower == "activextextclass" and not has_pv(properties):
         return "QLabel"
+    if name_lower == "activextextdspclass" and not properties.get("editable"):
+        return "PyDMLabel"
     if name_lower == "activelineclass" and (properties.get("fill") or properties.get("closePolygon")):
         return "PyDMDrawingIrregularPolygon"
     return EDM_TO_QT_CLASS.get(name_lower)

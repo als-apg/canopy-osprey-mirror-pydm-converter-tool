@@ -18,6 +18,7 @@ from typing import Literal
 
 from pydmconverter.bob.ir_adapter import bob_file_to_ir
 from pydmconverter.edm.ir_adapter import edm_file_to_ir
+from pydmconverter.edm.parser_helpers import SearchPaths
 from pydmconverter.ir.emit import to_wire_dict, write_screen_json
 from pydmconverter.ir.model import ScreenIR
 from pydmconverter.ir.registry import RegistryClient
@@ -39,6 +40,8 @@ def convert_to_ir(
     site: str | None = None,
     color_def_path: str | Path | None = None,
     scheme: SchemeResult | None = None,
+    search_paths: SearchPaths = None,
+    confine_file_refs: bool = False,
 ) -> ScreenIR:
     """Parse an ``.edl``, ``.ui`` or ``.bob`` file into a Screen IR, dispatching by suffix.
 
@@ -50,6 +53,14 @@ def convert_to_ir(
     ``scheme`` (``.edl`` and ``.bob`` inputs) is a flattened colour scheme whose imported names
     (``import.edm`` / ``import.phoebus``) become colour roles. The result is stamped ``schema_version`` ``"1.1"`` iff it carries a
     role (:func:`pydmconverter.scheme.stamp_schema_version`); it is never validated here.
+
+    ``search_paths`` (``.edl`` inputs only) are extra directories (a single directory
+    or a sequence) searched, like ``EDMDATAFILES``, for symbol files and ``calc.list``.
+    ``confine_file_refs`` is for untrusted input: file names taken from it (``.edl``
+    symbol files, a ``.ui`` PyDMTemplateRepeater's ``dataSource``/``templateFilename``)
+    are read only from inside the file's own directory or, for ``.edl``,
+    ``search_paths``, never ``EDMDATAFILES`` (see :func:`convert_bytes`,
+    :func:`edm_file_to_ir` and :func:`ui_file_to_ir`).
     """
     suffix = Path(input_path).suffix.lower()
     adapter = _ADAPTERS.get(suffix)
@@ -62,12 +73,14 @@ def convert_to_ir(
             color_list_path=color_list_path,
             calc_list_path=calc_list_path,
             site=site,
+            search_paths=search_paths,
+            confine_file_refs=confine_file_refs,
             scheme=scheme,
         )
     elif suffix == ".bob":
         ir = bob_file_to_ir(input_path, registry=registry, color_def_path=color_def_path, scheme=scheme)
     else:
-        ir = ui_file_to_ir(input_path, registry=registry)
+        ir = ui_file_to_ir(input_path, registry=registry, confine_file_refs=confine_file_refs)
     # Stamp here, the one point every entry point flows through, so callers that take the ScreenIR (not the
     # written JSON) see the right version. Role-free screens keep "1.0" and are byte-identical to before.
     ir.schema_version = stamp_schema_version(to_wire_dict(ir))
@@ -84,6 +97,9 @@ def convert_bytes(
     site: str | None = None,
     color_def_path: str | Path | None = None,
     scheme: SchemeResult | None = None,
+    filename: str | None = None,
+    search_paths: SearchPaths = None,
+    confine_file_refs: bool = False,
 ) -> ScreenIR:
     """Parse raw ``.edl``/``.ui``/``.bob`` bytes into a Screen IR, keyed on ``kind``.
 
@@ -91,6 +107,35 @@ def convert_bytes(
     hand the backend a server path), so callers need not spill uploads to disk. The
     EDM parser reads from a path, so the bytes are staged in a temp file scoped to
     this call rather than in every caller.
+
+    ``filename`` is the upload's original file name. Its basename (directories are
+    stripped; a missing ``.{kind}`` suffix is appended) names the staged file, so the
+    screen id and EDM title come from it. Without it, or when the filesystem cannot
+    hold that name, they are ``"screen"``.
+
+    ``search_paths`` (``kind="edl"`` only) are extra directories (a single directory or
+    a sequence) searched, like ``EDMDATAFILES``, for symbol files (activeSymbolClass)
+    and ``calc.list``: the staged file's own directory is a private temp dir, so
+    siblings of the original file are only found through here (e.g. the directory of
+    an extracted archive).
+
+    ``confine_file_refs`` should be set when ``data`` is untrusted, e.g. a user upload.
+    File names inside the input come verbatim from the bytes, so by default an absolute
+    name or ``..`` can read any file the process can reach and inline it into the
+    returned IR. With the flag on:
+
+    - ``kind="edl"``: an activeSymbolClass ``file`` is read only if it resolves inside
+      the private staging dir or one of ``search_paths`` (any of them: a
+      ``../sibling/x`` name between two search paths is fine). Absolute names, and
+      anything resolving outside all of them (``..``, a symlink pointing elsewhere),
+      are rejected before any existence check and never read. The symbol is left as
+      an empty group, warned as "outside the search paths" when no directory could
+      hold the name and as not found otherwise. ``EDMDATAFILES`` and its ``.`` (CWD)
+      default are not searched, and empty ``search_paths`` entries are ignored: pass
+      every allowed root explicitly.
+    - ``kind="ui"``: a PyDMTemplateRepeater's ``dataSource`` and ``templateFilename``
+      must resolve inside the staged file's directory, which holds only the upload,
+      so in practice the repeater becomes a placeholder with a warning.
 
     ``color_list_path`` (``kind="edl"`` only) points at an EDM ``colors.list`` palette
     used to resolve "index N" color props; when omitted it falls back to the
@@ -105,8 +150,17 @@ def convert_bytes(
     # temp stem), and conversion of identical bytes is byte-stable.
     tmp_dir = Path(tempfile.mkdtemp(prefix="pydmconv-"))
     try:
-        staged = tmp_dir / f"screen.{kind}"
-        staged.write_bytes(data)
+        staged = tmp_dir / _staged_name(filename, kind)
+        try:
+            staged.write_bytes(data)
+        except OSError as exc:
+            # The upload's name can be too long or hold characters this filesystem
+            # reserves; fall back to the fixed name rather than failing the conversion.
+            if staged.name == f"screen.{kind}":
+                raise
+            logger.warning("Cannot stage upload as %r (%s); using screen.%s", filename, exc, kind)
+            staged = tmp_dir / f"screen.{kind}"
+            staged.write_bytes(data)
         return convert_to_ir(
             staged,
             registry=registry,
@@ -115,9 +169,23 @@ def convert_bytes(
             site=site,
             color_def_path=color_def_path,
             scheme=scheme,
+            search_paths=search_paths,
+            confine_file_refs=confine_file_refs,
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _staged_name(filename: str | None, kind: str) -> str:
+    """Basename for a staged upload: ``filename`` without its directories (it must
+    not escape the temp dir), with the ``.{kind}`` suffix the dispatcher keys on;
+    ``screen.{kind}`` when no usable name is given."""
+    name = Path(filename.replace("\\", "/")).name if filename else ""
+    if name in ("", ".", "..") or "\x00" in name:
+        return f"screen.{kind}"
+    if Path(name).suffix.lower() != f".{kind}":
+        name = f"{name}.{kind}"
+    return name
 
 
 def _screen_json_path(input_path: Path, output_path: Path) -> Path:

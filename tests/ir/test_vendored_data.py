@@ -1,5 +1,8 @@
 """Pins the vendored Canopy contracts and checks they ship as package data.
 
+The widget registry is not vendored: since #166 its ``{id, qtMapping, qtPropMap}``
+files are this package's own Qt mappings (see ``tests/ir/test_ir_registry.py``).
+
 The values here must match the table in ``pydmconverter/ir/data/VENDORED_SCHEMA.md``.
 Everything is read through ``importlib.resources`` on the installed package, so a
 missing ``package-data`` glob fails here rather than at a user's import.
@@ -21,7 +24,6 @@ PINNED = {
     "canopy-color-scheme-1.schema.json": "94b2e2cb5c0ee1854ebe2b806ba2c52213f9ef2d218cb11a1be49bde3562c2b2",
     "schemes/canopy-default.json": "0a8f403e70f0b9a5dc2eb9679da24f72f54209e19a8a9043d3de636e49ce810d",
 }
-REGISTRY_DIGEST = "2b6d747019371cd688ed3ac0f33e1e82b8eb329764cca35e7be226a7e9e7ee86"
 
 
 def data_dir():
@@ -39,16 +41,6 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def registry_digest() -> str:
-    """sha256 of the ``shasum -a 256 *.json`` listing of widget-registry/, sorted by name."""
-    entries = sorted(
-        (entry for entry in (data_dir() / "widget-registry").iterdir() if entry.name.endswith(".json")),
-        key=lambda entry: entry.name,
-    )
-    listing = "".join(f"{sha256(entry.read_bytes())}  {entry.name}\n" for entry in entries)
-    return sha256(listing.encode())
-
-
 @pytest.mark.parametrize("rel", sorted(PINNED))
 def test_vendored_file_matches_pinned_sha256(rel):
     """Each vendored file is the exact byte copy recorded in VENDORED_SCHEMA.md."""
@@ -57,13 +49,8 @@ def test_vendored_file_matches_pinned_sha256(rel):
     assert sha256(node.read_bytes()) == PINNED[rel]
 
 
-def test_widget_registry_matches_pinned_digest():
-    """The registry snapshot is the byte copy recorded in VENDORED_SCHEMA.md."""
-    assert registry_digest() == REGISTRY_DIGEST
-
-
 def test_registry_files_end_in_one_newline():
-    """The byte copy keeps canopy's normalisation: exactly one final newline per file."""
+    """Registry files keep one normalisation: exactly one final newline per file."""
     for entry in (data_dir() / "widget-registry").iterdir():
         if entry.name.endswith(".json"):
             data = entry.read_bytes()
@@ -75,24 +62,24 @@ def test_vendored_schema_md_records_the_pinned_values():
     text = (data_dir() / "VENDORED_SCHEMA.md").read_text(encoding="utf-8")
     for rel, digest in PINNED.items():
         assert re.search(rf"`{re.escape(rel)}` \| `[^`]+` \| `{digest}`", text), rel
-    assert re.search(rf"`widget-registry/\*\.json` \| `[^`]+` \| `{REGISTRY_DIGEST}`", text)
 
 
 def test_vendored_schema_md_sources_are_repo_relative():
     """Sources are recorded as ``<repo>: <path>``, never an absolute or tool-local path."""
     text = (data_dir() / "VENDORED_SCHEMA.md").read_text(encoding="utf-8")
     sources = re.findall(r"\| `[^`]+` \| `([^`]+)` \| `[0-9a-f]{64}` \|", text)
-    assert len(sources) == len(PINNED) + 1
+    assert len(sources) == len(PINNED)
     for source in sources:
         repo, _, path = source.partition(": ")
         assert repo in {"canopy", "canopy-sdk-js"}, source
         assert path and not path.startswith(("/", "~")) and ".claude" not in path, source
 
 
-def test_beaver_snapshot_sha_is_one_commit_id():
-    """The registry pin names a single full commit id."""
-    text = (data_dir() / "widget-registry" / ".beaver-snapshot-sha").read_text(encoding="utf-8")
-    assert re.fullmatch(r"[0-9a-f]{40}\n", text)
+def test_widget_registry_is_not_a_vendored_snapshot():
+    """The registry is pydmconverter's own: no snapshot pin and no vendored-table row."""
+    assert not (data_dir() / "widget-registry" / ".beaver-snapshot-sha").is_file()
+    text = (data_dir() / "VENDORED_SCHEMA.md").read_text(encoding="utf-8")
+    assert "| `widget-registry/" not in text
 
 
 def test_schema_and_model_accept_1_0_and_1_1():

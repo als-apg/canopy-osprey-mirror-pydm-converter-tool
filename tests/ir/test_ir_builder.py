@@ -133,6 +133,88 @@ def test_explicit_macros_override_collection():
     assert screen.macros == []
 
 
+def test_valid_macro_name():
+    from pydmconverter.ir.macros import valid_macro_name
+
+    assert valid_macro_name("PREFIX") == "PREFIX"
+    assert valid_macro_name("dev") == "dev"
+    assert valid_macro_name("6X6FBCKPV") == "M_6X6FBCKPV"
+    assert valid_macro_name("_P") == "M__P"
+    assert valid_macro_name("A-B") == "A_B"
+    assert valid_macro_name("") == ""
+
+
+def test_invalid_macro_names_renamed_consistently():
+    """llrf/rf_mux_alarms references $(6X6FBCKPV): the IR macro pattern rejects a
+    leading digit, which aborted the whole screen. Declaration, prop references,
+    rule PVs, formula bindings and passed-on macro keys all get the same rename."""
+    from pydmconverter.ir.source import RuleSpec
+
+    nodes = [
+        SourceNode(
+            qt_class="PyDMLabel",
+            qt_props={"channel": "${6X6FBCKPV}.NAME"},
+            rules=[
+                RuleSpec(
+                    target_property="visible",
+                    name="V",
+                    pvs=[("${6X6FBCKPV}", True)],
+                    conditions=[("{0} != 0", True)],
+                    default=False,
+                )
+            ],
+        ),
+        SourceNode(qt_class="PyDMLabel", qt_props={"channel": "calc://sum?A=${6X6FBCKPV}&expr=A"}),
+        SourceNode(
+            qt_class="PyDMRelatedDisplayButton",
+            qt_props={
+                "filenames": ["rf_mux_alarms.edl"],
+                "macros": {"6X6FBCKPV": "FBCK:FB04:LG01:S5USED", "P": "X", '2 "Q': "junk"},
+            },
+        ),
+    ]
+    screen = _screen(nodes)
+    label, calc_label, button = screen.root.children
+    assert label.props["pv"] == "${M_6X6FBCKPV}.NAME"
+    assert label.rules[0].pvs[0].name == "${M_6X6FBCKPV}"
+    assert [f.bindings for f in screen.formulas] == [{"A": "${M_6X6FBCKPV}"}]
+    # Only keys a target could reference as ${KEY} are renamed; a mis-split key is left alone.
+    assert button.props["macros"] == {"M_6X6FBCKPV": "FBCK:FB04:LG01:S5USED", "P": "X", '2 "Q': "junk"}
+    assert [m.name for m in screen.macros] == ["M_6X6FBCKPV"]
+    assert screen.root.warnings == [
+        "Macro names the IR rejects were renamed (callers must pass the new name): 6X6FBCKPV -> M_6X6FBCKPV"
+    ]
+    assert validate_screen_json(to_wire_dict(screen)) == []
+
+
+def test_renamed_macro_colliding_with_a_used_name_is_warned():
+    """${6X} becomes ${M_6X}, which the screen already references (and passes on as
+    a macros key): both now resolve to one value. The rename stays deterministic
+    (callers and targets must agree), so the merge is reported, not avoided."""
+    nodes = [
+        SourceNode(qt_class="PyDMLabel", qt_props={"channel": "${6X}:A"}),
+        SourceNode(qt_class="PyDMLabel", qt_props={"channel": "${M_6X}:B"}),
+        SourceNode(
+            qt_class="PyDMRelatedDisplayButton",
+            qt_props={"filenames": ["t.edl"], "macros": {"M_6X": "1", "7Y": "2"}},
+        ),
+    ]
+    screen = _screen(nodes)
+    first, second, button = screen.root.children
+    assert first.props["pv"] == "${M_6X}:A"
+    assert second.props["pv"] == "${M_6X}:B"
+    assert button.props["macros"] == {"M_6X": "1", "M_7Y": "2"}
+    assert screen.root.warnings == [
+        "Macro names the IR rejects were renamed (callers must pass the new name): 6X -> M_6X, 7Y -> M_7Y",
+        "Renamed macros collide with other macro names and now share one value: 6X, M_6X -> M_6X",
+    ]
+
+
+def test_valid_macro_names_leave_no_rename_warning():
+    screen = _screen([SourceNode(qt_class="PyDMLabel", qt_props={"channel": "${PREFIX}:P"})])
+    assert screen.root.warnings == []
+
+
 def test_rules_get_ids_and_contribute_macros():
     """RuleSpecs become Rules with allocated r-NNN ids; rule PV macros are declared."""
     from pydmconverter.ir.source import RuleSpec
@@ -346,3 +428,202 @@ def test_pre_build_intern_numbers_before_calc_hoisting():
     assert screen.formulas[0].bindings == {"A": "${P}:STAT"}
     assert screen.formulas[1].expression == "A*2"
     assert screen.root.children[0].props["pv"] == "fox://f-002"
+
+
+def test_page_wrapper_does_not_grow_screen():
+    """A top-level wrapper exactly covering the declared screen (a .ui centralwidget)
+    is not content: only its children decide whether the canvas grows."""
+    small = SourceNode(qt_class="QLabel", qt_props={"text": "x"}, geometry=(10, 10, 100, 20))
+    wrapper = SourceNode(qt_class="QWidget", geometry=(0, 0, 800, 600), children=[small])
+    screen = _screen([wrapper])
+    assert (screen.metadata.size.width, screen.metadata.size.height) == (800, 600)
+    # a child past the edge still grows it, by the usual margin
+    wide = SourceNode(qt_class="QLabel", qt_props={"text": "x"}, geometry=(700, 600, 150, 40))
+    wrapper = SourceNode(qt_class="QWidget", geometry=(0, 0, 800, 600), children=[wide])
+    screen = _screen([wrapper])
+    assert (screen.metadata.size.width, screen.metadata.size.height) == (858, 648)
+
+
+def test_fixed_canvas_keeps_declared_size_and_counts_off_canvas_widgets():
+    """grow_to_fit=False (EDM): the window is exactly w x h. Overhanging and
+    parked-off-screen widgets stay in the IR; one root warning counts the ones
+    lying entirely outside."""
+    from pydmconverter.ir.builder import IRBuilder
+    from pydmconverter.ir.registry import VendoredRegistry
+    from pydmconverter.ir.source import SourceNode
+
+    nodes = [
+        SourceNode(qt_class="QLabel", qt_props={"text": "in"}, geometry=(10, 10, 50, 20)),
+        SourceNode(qt_class="QLabel", qt_props={"text": "overhang"}, geometry=(180, 10, 50, 20)),
+        SourceNode(
+            qt_class=None,
+            registry_id="group",
+            geometry=(0, 55000039, 40, 40),
+            children=[
+                SourceNode(qt_class="QLabel", qt_props={"text": "a"}, geometry=(0, 55000039, 20, 20)),
+                SourceNode(qt_class="QLabel", qt_props={"text": "b"}, geometry=(20, 55000039, 20, 20)),
+            ],
+        ),
+    ]
+    ir = IRBuilder(VendoredRegistry()).build_screen(
+        screen_id="t", title="t", source_type="edl-converter", size=(200, 100), top_level=nodes, grow_to_fit=False
+    )
+    assert (ir.metadata.size.width, ir.metadata.size.height) == (200, 100)
+    assert (ir.root.geometry.width, ir.root.geometry.height) == (200, 100)
+    assert len(ir.root.children) == 3  # nothing dropped
+    assert ir.root.warnings == [
+        "2 widget(s) lie entirely outside the 200x100 canvas; kept in the IR, clipped at runtime"
+    ]
+
+
+def test_fixed_canvas_without_off_canvas_widgets_has_no_warning():
+    from pydmconverter.ir.builder import IRBuilder
+    from pydmconverter.ir.registry import VendoredRegistry
+    from pydmconverter.ir.source import SourceNode
+
+    child = SourceNode(qt_class="QLabel", qt_props={"text": "x"}, geometry=(0, 0, 200, 100))
+    ir = IRBuilder(VendoredRegistry()).build_screen(
+        screen_id="t", title="t", source_type="edl-converter", size=(200, 100), top_level=[child], grow_to_fit=False
+    )
+    assert (ir.metadata.size.width, ir.metadata.size.height) == (200, 100)
+    assert ir.root.warnings == []
+
+
+def test_undeclared_dimension_is_sized_from_content():
+    """A None dimension (source declares none) is content extent + margin, even
+    when the canvas otherwise does not grow; screen notes land on the root."""
+    from pydmconverter.ir.builder import IRBuilder
+    from pydmconverter.ir.registry import VendoredRegistry
+    from pydmconverter.ir.source import SourceNode
+
+    child = SourceNode(qt_class="QLabel", qt_props={"text": "x"}, geometry=(10, 10, 100, 290))
+    ir = IRBuilder(VendoredRegistry()).build_screen(
+        screen_id="t",
+        title="t",
+        source_type="edl-converter",
+        size=(684, None),
+        top_level=[child],
+        grow_to_fit=False,
+        warnings=["note"],
+    )
+    assert (ir.metadata.size.width, ir.metadata.size.height) == (684, 308)
+    assert ir.root.warnings == ["note"]
+
+
+def test_literal_dollar_brace_is_neither_declared_nor_renamed():
+    """A front-end marks the brace of a literal ${VAR} (EDM's $\\{VAR\\}, a shell
+    variable) with LITERAL_BRACE. Declaring VAR (default "") would let the runtime
+    blank it, and renaming ${6X} would change the command; every string gets its
+    brace back once the macros are collected."""
+    from pydmconverter.ir.macros import LITERAL_BRACE as B
+    from pydmconverter.ir.source import RuleSpec
+
+    nodes = [
+        SourceNode(
+            qt_class="PyDMLabel",
+            qt_props={"channel": f"calc://sum?A=${{P}}:A&B=${B}b}}:B&expr=A+B", "text": f"${B}m}} ${B}6X}} {{1..5}}"},
+            rules=[
+                RuleSpec(
+                    target_property="visible",
+                    name=f"${B}r}}",
+                    pvs=[(f"${B}r}}:Y", True)],
+                    conditions=[("{0} != 0", True)],
+                    default=False,
+                )
+            ],
+            warnings=[f"note ${B}w}}"],
+        ),
+        SourceNode(
+            qt_class="PyDMRelatedDisplayButton",
+            qt_props={"filenames": ["t.edl"], "macros": {"acsw": f"${B}acsw}}"}},
+        ),
+    ]
+    screen = _screen(nodes)
+    label, button = screen.root.children
+    assert [m.name for m in screen.macros] == ["P"]
+    assert label.props["text"] == "${m} ${6X} {1..5}"
+    assert label.rules[0].name == "${r}"
+    assert label.rules[0].pvs[0].name == "${r}:Y"
+    assert label.warnings == ["note ${w}"]
+    assert [f.bindings for f in screen.formulas] == [{"A": "${P}:A", "B": "${b}:B"}]
+    assert button.props["macros"] == {"acsw": "${acsw}"}
+    assert screen.root.warnings == []
+    assert B not in to_json(screen)
+    assert validate_screen_json(to_wire_dict(screen)) == []
+
+
+def test_literal_dollar_brace_sharing_a_macro_name_is_warned():
+    """camac/camac_lu_from_epics_detail.edl runs `luCWRestart $\\{LOCA\\} 0` beside
+    $(LOCA) PVs. The runtime has no escape for a literal ${, so LOCA's value
+    replaces the shell variable too; the screen says so."""
+    from pydmconverter.ir.macros import LITERAL_BRACE as B
+
+    nodes = [
+        SourceNode(qt_class="PyDMLabel", qt_props={"channel": "${LOCA}:X", "text": f"luCWRestart ${B}LOCA}} 0"}),
+    ]
+    screen = _screen(nodes)
+    assert [m.name for m in screen.macros] == ["LOCA"]
+    assert screen.root.children[0].props["text"] == "luCWRestart ${LOCA} 0"
+    assert screen.root.warnings == [
+        "Literal ${NAME} text (not a macro in the source, e.g. a shell variable) shares its name with a macro, "
+        "so the runtime substitutes the macro's value into it: LOCA"
+    ]
+
+
+# --- the epic's registry entries, re-expressed in #166's {id, qtMapping, qtPropMap} shape --
+
+
+def test_xy_plot_entry_maps_scatter_plot_props():
+    """xy-plot owns PyDMScatterPlot; its prop map renames and JSON-decodes curves/yAxes."""
+    node = SourceNode(
+        qt_class="PyDMScatterPlot",
+        qt_props={
+            "title": "Orbit",
+            "curves": ['{"x_channel": "ca://X", "y_channel": "ca://Y"}'],
+            "yAxes": ['{"name": "Axis 1"}'],
+            "showLegend": True,
+            "notMapped": 1,
+        },
+        geometry=(0, 0, 300, 200),
+    )
+    screen = _screen([node])
+    plot = screen.root.children[0]
+    assert plot.type == "xy-plot"
+    assert plot.props == {
+        "title": "Orbit",
+        "curves": [{"x_channel": "ca://X", "y_channel": "ca://Y"}],
+        "yAxes": [{"name": "Axis 1"}],
+        "showLegend": True,
+    }
+    assert validate_screen_json(to_wire_dict(screen)) == []
+
+
+def test_pv_array_plot_entry_resolves_by_id_without_a_qt_class():
+    """pv-array-plot is an IR-only id: no Qt class claims it, a registry_id node builds it."""
+    registry = VendoredRegistry()
+    definition = registry.by_id("pv-array-plot")
+    assert definition is not None
+    assert definition.qt_class is None
+    assert definition.qt_prop_map == {}
+    node = SourceNode(qt_class=None, registry_id="pv-array-plot", geometry=(0, 0, 300, 200))
+    built = _screen([node]).root.children[0]
+    assert built.type == "pv-array-plot"
+
+
+def test_pv_button_entry_maps_flat_and_images():
+    """The epic's pv-button additions survive the reduced shape: flat -> transparent, images."""
+    node = SourceNode(
+        qt_class="PyDMPushButton",
+        qt_props={"channel": "ca://B", "flat": True, "onImage": "on.png", "offImage": "off.png"},
+        geometry=(0, 0, 80, 30),
+    )
+    built = _screen([node]).root.children[0]
+    assert built.type == "pv-button"
+    assert built.props == {"pv": "B", "transparent": True, "onImage": "on.png", "offImage": "off.png"}
+
+
+def test_regular_button_entry_maps_flat_to_transparent():
+    node = SourceNode(qt_class="QPushButton", qt_props={"text": "Go", "flat": True}, geometry=(0, 0, 80, 30))
+    built = _screen([node]).root.children[0]
+    assert built.type == "regular-button"
+    assert built.props == {"label": "Go", "transparent": True}

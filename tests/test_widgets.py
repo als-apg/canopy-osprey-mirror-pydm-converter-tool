@@ -1,3 +1,4 @@
+import json
 import xml.etree.ElementTree as ET
 import xml.etree.ElementTree as etree
 
@@ -22,9 +23,13 @@ from pydmconverter.widgets import (
     PyDMDrawingPolyline,
     PyDMWaveformPlot,
     PyDMAnalogIndicator,
+    PyDMEmbeddedDisplay,
+    QWidget,
+    edm_to_ui_filename,
 )
 
 from pydmconverter.widgets_helpers import XMLSerializableMixin, Alarmable, Drawable, Hidable
+from pydmconverter.custom_types import RGBA
 
 
 def get_property_value(prop: etree.Element) -> Optional[str]:
@@ -424,6 +429,134 @@ def test_pydmrelateddisplay_button_list_titles():
     assert strings == ["asynOctet Interface I/O", "Register interfaces I/O", "Serial port parameters"]
 
 
+def test_pydmrelateddisplay_button_list_macros():
+    """List-valued macros are a StringList: PyDM pairs macros[i] with filenames[i]."""
+    widget = PyDMRelatedDisplayButton(macros=['{"DEV": "A1"}', "{}", '{"DEV": "C3"}'])
+    widget.displayFileName = ["a.edl", "b.edl", "c.edl"]
+
+    properties: List[ET.Element] = widget.generate_properties()
+
+    macros_prop = next(p for p in properties if p.get("name") == "macros")
+    assert macros_prop.find("string") is None
+    strings = [s.text for s in macros_prop.findall("stringlist/string")]
+    assert strings == ['{"DEV": "A1"}', "{}", '{"DEV": "C3"}']
+
+
+def test_edm_to_ui_filename():
+    """EDM display names map to .ui names without eating unrelated dots."""
+    # EDM appends ".edl" to a bare name, so both forms converge.
+    assert edm_to_ui_filename("GigE_controls") == "GigE_controls.ui"
+    assert edm_to_ui_filename("GigE_controls.edl") == "GigE_controls.ui"
+    # A legacy "name.edl;P=..." macro suffix is dropped.
+    assert edm_to_ui_filename("a.edl;P=1") == "a.ui"
+    # A version dot is part of the name, not an extension.
+    assert edm_to_ui_filename("GigE_v1.2") == "GigE_v1.2.ui"
+    # ".edl" only counts as an extension when it is the actual suffix.
+    assert edm_to_ui_filename("screen.edl.bak") == "screen.edl.bak.ui"
+    assert edm_to_ui_filename("sub.edl_v2/screen") == "sub.edl_v2/screen.ui"
+    # An already-converted name passes through untouched.
+    assert edm_to_ui_filename("x.ui") == "x.ui"
+
+
+def test_pydmrelateddisplay_button_filenames_converted():
+    """displayFileName entries are converted via edm_to_ui_filename, not split on the last dot."""
+    widget = PyDMRelatedDisplayButton()
+    widget.displayFileName = ["GigE_v1.2", "a.edl;P=1"]
+
+    properties: List[ET.Element] = widget.generate_properties()
+
+    filenames_prop = next((p for p in properties if p.get("name") == "filenames"), None)
+    assert filenames_prop is not None
+    stringlist = filenames_prop.find("stringlist")
+    assert stringlist is not None
+    strings = [s.text for s in stringlist.findall("string")]
+    assert strings == ["GigE_v1.2.ui", "a.ui"]
+
+
+# --- Tests for Qt mnemonic (&) escaping ---
+
+
+def test_qpushbutton_text_escapes_ampersand():
+    """QPushButton text has mnemonics enabled, so a literal & must become &&."""
+    button = QPushButton(text="PLC & UPS")
+    properties: List[ET.Element] = button.generate_properties()
+    prop_dict = {prop.get("name"): get_property_value(prop) for prop in properties}
+    assert prop_dict.get("text") == "PLC && UPS"
+
+
+def test_pydmpushbutton_on_label_escapes_ampersand():
+    widget = PyDMPushButton(on_label="On & Off")
+    properties: List[ET.Element] = widget.generate_properties()
+    prop_dict = {prop.get("name"): get_property_value(prop) for prop in properties}
+    assert prop_dict.get("text") == "On && Off"
+
+
+def test_pydmrelateddisplay_button_list_titles_escapes_ampersand():
+    """List-valued titles should have each entry escaped for Qt menu actions."""
+    widget = PyDMRelatedDisplayButton()
+    widget.titles = ["A & B", "C"]
+    widget.displayFileName = ["a.edl", "c.edl"]
+
+    properties: List[ET.Element] = widget.generate_properties()
+
+    titles_prop = next((p for p in properties if p.get("name") == "titles"), None)
+    assert titles_prop is not None
+    stringlist = titles_prop.find("stringlist")
+    assert stringlist is not None
+    strings = [s.text for s in stringlist.findall("string")]
+    assert strings == ["A && B", "C"]
+
+
+def test_pydmrelateddisplay_button_str_titles_escapes_ampersand():
+    """A str-valued titles attribute should also be escaped."""
+    widget = PyDMRelatedDisplayButton(titles="A & B")
+    widget.displayFileName = ["a.edl"]
+
+    properties: List[ET.Element] = widget.generate_properties()
+    prop_dict = {prop.get("name"): get_property_value(prop) for prop in properties}
+    assert prop_dict.get("titles") == "A && B"
+
+
+def test_pydmshellcommand_titles_escape_ampersand():
+    widget = PyDMShellCommand(command=["ls"], titles=["Do & See"])
+    properties: List[ET.Element] = widget.generate_properties()
+
+    titles_prop = next((p for p in properties if p.get("name") == "titles"), None)
+    assert titles_prop is not None
+    stringlist = titles_prop.find("stringlist")
+    assert stringlist is not None
+    strings = [s.text for s in stringlist.findall("string")]
+    assert strings == ["Do && See"]
+
+
+def test_qwidget_title_attribute_escapes_ampersand():
+    """QWidget.title (QTabWidget page title) is emitted as an <attribute>, not a <property>."""
+    widget = QWidget(title="Tab & Co")
+    properties: List[ET.Element] = widget.generate_properties()
+
+    title_attr = next((p for p in properties if p.tag == "attribute" and p.get("name") == "title"), None)
+    assert title_attr is not None
+    string_el = title_attr.find("string")
+    assert string_el is not None
+    assert string_el.text == "Tab && Co"
+
+
+def test_qlabel_text_not_escaped():
+    """Regression guard: QLabel renders & literally and must not be escaped."""
+    widget = QLabel(text="A & B")
+    properties: List[ET.Element] = widget.generate_properties()
+    prop_dict = {prop.get("name"): get_property_value(prop) for prop in properties}
+    assert prop_dict.get("text") == "A & B"
+
+
+def test_pydmlabel_text_not_escaped():
+    """Regression guard: PyDMLabel renders & literally and must not be escaped."""
+    widget = PyDMLabel(text="A & B")
+    properties: List[ET.Element] = widget.generate_properties()
+    prop_dict = {prop.get("name"): get_property_value(prop) for prop in properties}
+    assert prop_dict.get("text") == "A & B"
+
+
 # --- Tests for QComboBox ---
 
 
@@ -615,6 +748,24 @@ def test_waveformplot_no_limits_enables_autorange():
     assert yaxes_prop is None
 
 
+def test_waveformplot_axis_and_curve_strings_are_valid_json():
+    """A backslash or quote in a label or channel is escaped in the yAxes/curves JSON."""
+    label, x_channel, y_channel = 'Gap "mm"', r"CALC\sum(A,B)", "ca://Y"
+    widget = PyDMWaveformPlot(
+        minYRange=0,
+        maxYRange=1,
+        yLabel=label,
+        x_channel=[x_channel],
+        y_channel=[y_channel],
+        plotColor=[(255, 0, 0, 255)],
+    )
+    properties = {p.get("name"): p for p in widget.generate_properties()}
+    y_axis = json.loads(properties["yAxes"].find("stringlist").find("string").text)
+    assert y_axis["label"] == label
+    curve = json.loads(properties["curves"].find("stringlist").find("string").text)
+    assert (curve["x_channel"], curve["y_channel"]) == (x_channel, y_channel)
+
+
 # --- Tests for PyDMAnalogIndicator ---
 
 
@@ -653,3 +804,51 @@ def test_pydmanalogindicator_defaults():
     assert "showUnits" not in prop_dict
     assert "precision" not in prop_dict
     assert "title" not in prop_dict
+
+
+def last_style_sheet(element: etree.Element) -> str:
+    """The last styleSheet property, the one the .ui loader leaves in effect."""
+    return get_property_value(element.findall("property[@name='styleSheet']")[-1])
+
+
+def test_pydmembeddeddisplay_pip_style_scoped_to_widget():
+    widget = PyDMEmbeddedDisplay(
+        name="activePipClass123",
+        filename="child.edl",
+        foreground_color=RGBA(0, 0, 255),
+        background_color=RGBA(200, 200, 200),
+    )
+    style = last_style_sheet(widget.to_xml())
+
+    # Unscoped, Qt would also draw the border and background on the embedded screen's
+    # widgets. EDM never applies fgColor to the embedded screen, so it is dropped.
+    assert style == (
+        "* { background-color: none; } "
+        "PyDMEmbeddedDisplay#activePipClass123 { border: 1px solid black; background-color: rgba(200, 200, 200, 255); }"
+    )
+
+
+def test_pydmembeddeddisplay_pip_border_selector_uses_object_name():
+    element = PyDMEmbeddedDisplay(name="activePipClass42").to_xml()
+    style = last_style_sheet(element)
+
+    assert element.get("name") == "activePipClass42"
+    assert style == "* { background-color: none; } PyDMEmbeddedDisplay#activePipClass42 { border: 1px solid black; }"
+
+
+def test_pydmembeddeddisplay_pip_without_file_has_no_background():
+    widget = PyDMEmbeddedDisplay(
+        name="activePipClass7", foreground_color=RGBA(0, 0, 255), background_color=RGBA(200, 200, 200)
+    )
+    style = last_style_sheet(widget.to_xml())
+
+    # EDM creates no frame without a file, so nothing is painted.
+    assert style == "* { background-color: none; } PyDMEmbeddedDisplay#activePipClass7 { border: 1px solid black; }"
+
+
+def test_pydmembeddeddisplay_non_pip_has_no_border():
+    widget = PyDMEmbeddedDisplay(name="activeChoiceButtonClass1_page0", foreground_color=RGBA(0, 0, 255))
+
+    assert last_style_sheet(widget.to_xml()) == "color: rgba(0, 0, 255, 255);background-color: none;"
+    plain = PyDMEmbeddedDisplay(name="activeChoiceButtonClass1_page1")
+    assert last_style_sheet(plain.to_xml()) == "background-color: transparent;"

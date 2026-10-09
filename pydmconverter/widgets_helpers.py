@@ -3,7 +3,9 @@ from typing import Any, ClassVar, List, Optional, Tuple, Union, Dict
 import xml.etree.ElementTree as etree
 from xml.etree import ElementTree as ET
 from pydmconverter.custom_types import RGBA, RuleArguments
+import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,17 @@ HIDDEN_WIDGET_TYPES = [
     "mzxygraphclass",
     "activerampbuttonclass",
 ]
+
+
+def _json_text(value: str) -> str:
+    """``value`` escaped for use between the quotes of a JSON string (``\\``, ``"``, control characters)."""
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _json_object(value: dict) -> str:
+    """value as the JSON text PyDM reads for a rule or curve: every string
+    escaped, separated by ", " and ": " like PyDM's own."""
+    return json.dumps(value, ensure_ascii=False)
 
 
 class XMLConvertible:
@@ -429,6 +442,34 @@ class Double(XMLConvertible):
         double_tag: etree.Element = etree.SubElement(prop, "double")  # Need to use double because float is unsupported
         double_tag.text = str(self.value)
         return prop
+
+
+def escape_qt_mnemonic(text):
+    """Escape ``&`` as ``&&`` for Qt widgets that treat ``&`` as a mnemonic marker.
+
+    QPushButton, tab titles, QMenu actions, QGroupBox, QCheckBox and QRadioButton
+    swallow a single ``&`` and underline the next character; a literal ampersand
+    must be written ``&&``. QLabel renders ``&`` literally, so this must NOT be
+    applied to label text. Idempotent: already-escaped ``&&`` is left alone, so
+    ``"A && B"`` stays ``"A && B"`` and never becomes ``"A &&&& B"``.
+    Non-string inputs pass through unchanged.
+    """
+    if not isinstance(text, str) or "&" not in text:
+        return text
+    # Collapse any existing "&&" to a single "&", then double every "&".
+    return text.replace("&&", "&").replace("&", "&&")
+
+
+def unescape_qt_mnemonic(text):
+    """Inverse of :func:`escape_qt_mnemonic`: ``&&`` -> ``&``.
+
+    Used when reading Qt ``.ui`` text destined for a renderer that shows ``&``
+    literally (the react/IR target). A stray single ``&`` (a real Qt mnemonic
+    marker) is dropped, matching what Qt would display.
+    """
+    if not isinstance(text, str) or "&" not in text:
+        return text
+    return re.sub(r"&(&?)", r"\1", text)
 
 
 @dataclass
@@ -935,23 +976,16 @@ class BoolRule(XMLConvertible):
             show_on_false_string = "True if ch[0]!=1 else False"
         expression = show_on_true_string if self.show_on_true else show_on_false_string
 
-        output_string = (
-            "{"
-            f'"name": "{self.rule_type}_{self.channel}", '
-            f'"property": "{self.rule_type}", '
-            f'"initial_value": "{self.initial_value}", '
-            f'"expression": "{expression}", '
-            '"channels": ['
-            "{"
-            f'"channel": "{self.channel}", '
-            '"trigger": true, '
-            '"use_enum": false'
-            "}"
-            "], "
-            '"notes": "{self.notes}"'
-            "}"
+        return _json_object(
+            {
+                "name": f"{self.rule_type}_{self.channel}",
+                "property": self.rule_type,
+                "initial_value": str(self.initial_value),
+                "expression": expression,
+                "channels": [{"channel": self.channel, "trigger": True, "use_enum": False}],
+                "notes": self.notes,
+            }
         )
-        return output_string
 
 
 @dataclass
@@ -994,13 +1028,15 @@ class MultiRule(XMLConvertible):
         expression_list = []
         if self.rule_list is not None:
             for i, rule in enumerate(self.rule_list):
-                rule_type, channel, initial_value, show_on_true, visMin, visMax = rule
+                channel = rule.channel
                 replacement_init = None
                 if channel.startswith("loc://") and "init=${" in channel:
                     replacement_init = channel[channel.find("init=") + len("init=") :]
                     replacement_init = replacement_init[: replacement_init.find("}") + 1]
-                channel_list.append(f'{{"channel": "{channel}", "trigger": true, "use_enum": false}}')
-                expression_list.append(self.get_expression(i, show_on_true, visMin, visMax, replacement_init))
+                channel_list.append({"channel": channel, "trigger": True, "use_enum": False})
+                expression_list.append(
+                    self.get_expression(i, rule.show_on_true, rule.visMin, rule.visMax, replacement_init)
+                )
         if self.hide_on_disconnect_channel is not None:
             new_index = len(self.rule_list)
             replacement_init = None
@@ -1010,24 +1046,28 @@ class MultiRule(XMLConvertible):
                 ]
                 replacement_init = replacement_init[: replacement_init.find("}") + 1]
             expression_list.append(self.get_hide_on_disconnect_expression(new_index, replacement_init))
-            channel_list.append(
-                f'{{"channel": "{self.hide_on_disconnect_channel}", "trigger": true, "use_enum": false}}'
-            )
+            channel_list.append({"channel": self.hide_on_disconnect_channel, "trigger": True, "use_enum": False})
         if not expression_list:
             return ""
         expression_str = "(" + ") and (".join(expression_list) + ")"
-
-        output_string = (
-            "{"
-            f'"name": "{self.rule_type}", '
-            f'"property": "{self.rule_type}", '
-            f'"initial_value": "false", '
-            f'"expression": "{expression_str}", '
-            f'"channels": [{", ".join(channel_list)}], '
-            f'"notes": "{self.notes}"'
-            "}"
+        # Until its channels connect the widget shows the initial value: true
+        # only when every condition asks for it.
+        starts_true = (
+            bool(self.rule_list)
+            and self.hide_on_disconnect_channel is None
+            and all(rule.initial_value for rule in self.rule_list)
         )
-        return output_string
+
+        return _json_object(
+            {
+                "name": self.rule_type,
+                "property": self.rule_type,
+                "initial_value": "true" if starts_true else "false",
+                "expression": expression_str,
+                "channels": channel_list,
+                "notes": self.notes,
+            }
+        )
 
     def get_expression(self, index, show_on_true, visMin, visMax, init):  # TODO: Can clean up with fstrings
         """
@@ -1157,11 +1197,16 @@ class StyleSheet(XMLConvertible):
 
     Attributes
     ----------
-    lines : List[str]
-        A list of stylesheet lines.
+    styles : Dict[str, Any]
+        Declarations for the widget. With no selector Qt applies them to the
+        widget and every descendant.
+    scoped : Dict[str, Dict[str, Any]]
+        Declarations keyed by the selector they apply to, e.g.
+        ``{"PyDMEmbeddedDisplay#name": {"border": "1px solid black"}}``.
     """
 
     styles: Dict[str, Any]
+    scoped: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def _format_value(self, key: str, value: Any) -> str:
         if isinstance(value, RGBA) and key in ("color", "background-color"):
@@ -1187,6 +1232,15 @@ class StyleSheet(XMLConvertible):
         style_str: str = self.to_style_string()
         if "background-color" not in self.styles:
             style_str += "background-color: none;"
+        if self.scoped:
+            # Qt reads a sheet without selectors as "* { ... }" and drops a sheet that
+            # mixes bare declarations with selector rules, so the unscoped ones go
+            # under "*" explicitly.
+            rules = [f"* {{ {style_str} }}"]
+            for selector, styles in self.scoped.items():
+                declarations = " ".join(self._format_value(k, v) for k, v in styles.items())
+                rules.append(f"{selector} {{ {declarations} }}")
+            style_str = " ".join(rules)
         string_elem.text = style_str
         return prop
 
@@ -1622,6 +1676,7 @@ class Legible(Tangible):
     text: Optional[str] = None
     font: dict = field(default_factory=dict)
     alignment: Optional[str] = None
+    text_has_mnemonics: ClassVar[bool] = False
 
     def generate_properties(self) -> List[etree.Element]:
         """
@@ -1634,7 +1689,8 @@ class Legible(Tangible):
         """
         properties: List[etree.Element] = super().generate_properties()
         if self.text is not None:
-            properties.append(Text("text", self.text).to_xml())
+            value = escape_qt_mnemonic(self.text) if self.text_has_mnemonics else self.text
+            properties.append(Text("text", value).to_xml())
         if self.font:
             properties.append(Font(**self.font).to_xml())
         if self.alignment is not None:
@@ -1689,7 +1745,10 @@ class Controllable(Tangible):
             properties.append(PyDMToolTip(self.pydm_tool_tip).to_xml())
         if self.visPvList is not None:
             for elem in self.visPvList:
-                if len(elem) == 4:
+                group_initial = False
+                if len(elem) == 5:
+                    group_channel, group_min, group_max, group_invert, group_initial = elem
+                elif len(elem) == 4:
                     group_channel, group_min, group_max, group_invert = elem
                 else:
                     group_channel, group_min, group_max = elem
@@ -1698,7 +1757,7 @@ class Controllable(Tangible):
                     RuleArguments(
                         "Visible",
                         group_channel,
-                        False,
+                        group_initial,
                         not group_invert,
                         group_min,
                         group_max,
@@ -1889,7 +1948,31 @@ class Drawable(Tangible):
 
 
 class PageHeader:
-    def create_page_header(self, edm_parser, scrollable=False):
+    def create_page_header(self, edm_parser, scrollable=False, content_size=None):
+        """
+        Build the .ui skeleton (Form, optional scroll area, centralwidget) for a screen.
+
+        Parameters
+        ----------
+        edm_parser : EDMFileParser
+            Parser whose ui holds the screen's declared size and properties.
+        scrollable : bool, optional
+            Wrap centralwidget in a QScrollArea, by default False.
+        content_size : tuple[int, int], optional
+            (width, height) needed to cover the screen's widgets. centralwidget, and in
+            scrollable mode scrollAreaWidgetContents, are given this size so content placed past
+            the declared screen size stays reachable; Form and the scroll area keep the declared
+            size. Defaults to the declared screen size.
+
+        Returns
+        -------
+        tuple[ET.Element, ET.Element]
+            The <ui> root element and the centralwidget element to add widgets to.
+        """
+        if content_size is None:
+            content_size = (edm_parser.ui.width, edm_parser.ui.height)
+        content_width, content_height = content_size
+
         ui_element = ET.Element("ui", attrib={"version": "4.0"})
 
         class_element = ET.SubElement(ui_element, "class")
@@ -1952,8 +2035,8 @@ class PageHeader:
             sc_rect = ET.SubElement(sc_geometry, "rect")
             ET.SubElement(sc_rect, "x").text = "0"
             ET.SubElement(sc_rect, "y").text = "0"
-            ET.SubElement(sc_rect, "width").text = str(edm_parser.ui.width)
-            ET.SubElement(sc_rect, "height").text = str(edm_parser.ui.height)
+            ET.SubElement(sc_rect, "width").text = str(content_width)
+            ET.SubElement(sc_rect, "height").text = str(content_height)
 
             central_widget = ET.SubElement(
                 scroll_contents,
@@ -1972,6 +2055,15 @@ class PageHeader:
                     "name": "centralwidget",
                 },
             )
+
+        # centralwidget has no layout; without an explicit geometry Qt adjustSize()s it to the
+        # children visible at first show, clipping rule-hidden widgets that appear later.
+        cw_geometry = ET.SubElement(central_widget, "property", attrib={"name": "geometry"})
+        cw_rect = ET.SubElement(cw_geometry, "rect")
+        ET.SubElement(cw_rect, "x").text = "0"
+        ET.SubElement(cw_rect, "y").text = "0"
+        ET.SubElement(cw_rect, "width").text = str(content_width)
+        ET.SubElement(cw_rect, "height").text = str(content_height)
 
         return ui_element, central_widget
 

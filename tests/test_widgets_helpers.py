@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from pydmconverter.widgets_helpers import (
@@ -33,7 +35,10 @@ from pydmconverter.widgets_helpers import (
     Text,
     BoolRule,
     MultiRule,
+    escape_qt_mnemonic,
+    unescape_qt_mnemonic,
 )
+from pydmconverter.custom_types import RGBA, RuleArguments
 
 
 def test_XMLConvertible():
@@ -512,6 +517,68 @@ def testStyleSheet():
     assert target == styleSheet.to_string()
 
 
+def testStyleSheetScopedWrapsUnscopedUnderStar():
+    target = "\n".join(
+        [
+            '<property name="styleSheet">',
+            "  <string>* { color: rgba(0, 0, 255, 255);background-color: none; } "
+            "PyDMEmbeddedDisplay#pip1 { border: 1px solid black; }</string>",
+            "</property>",
+        ]
+    )
+    styleSheet = StyleSheet({"color": RGBA(0, 0, 255)}, {"PyDMEmbeddedDisplay#pip1": {"border": "1px solid black"}})
+    assert target == styleSheet.to_string()
+
+
+def testStyleSheetScopedRulesFormatRGBAAndKeepOrder():
+    target = "\n".join(
+        [
+            '<property name="styleSheet">',
+            "  <string>* { background-color: none; } "
+            "PyDMEmbeddedDisplay#zeta { background-color: rgba(200, 200, 200, 128); border: 2px solid red; } "
+            "PyDMEmbeddedDisplay#alpha { border: 1px solid black; }</string>",
+            "</property>",
+        ]
+    )
+    styleSheet = StyleSheet(
+        {},
+        {
+            "PyDMEmbeddedDisplay#zeta": {"background-color": RGBA(200, 200, 200, 128), "border": "2px solid red"},
+            "PyDMEmbeddedDisplay#alpha": {"border": "1px solid black"},
+        },
+    )
+    assert target == styleSheet.to_string()
+
+
+def testStyleSheetScopedWithExplicitBackground():
+    target = "\n".join(
+        [
+            '<property name="styleSheet">',
+            "  <string>* { color: red; background-color: rgba(200, 200, 200, 255); } "
+            "PyDMEmbeddedDisplay#pip1 { border: 1px solid black; }</string>",
+            "</property>",
+        ]
+    )
+    styleSheet = StyleSheet(
+        {"color": "red", "background-color": RGBA(200, 200, 200)},
+        {"PyDMEmbeddedDisplay#pip1": {"border": "1px solid black"}},
+    )
+    assert target == styleSheet.to_string()
+
+
+def testStyleSheetEmptyScopedMatchesUnscoped():
+    target = "\n".join(
+        [
+            '<property name="styleSheet">',
+            "  <string>color: rgba(0, 0, 255, 255); border: 1px solid black;background-color: none;</string>",
+            "</property>",
+        ]
+    )
+    styles = {"color": RGBA(0, 0, 255), "border": "1px solid black"}
+    assert target == StyleSheet(styles).to_string()
+    assert target == StyleSheet(styles, {}).to_string()
+
+
 def testText():
     target = "\n".join(
         [
@@ -685,3 +752,88 @@ class TestMultiRuleExpression:
         rule = MultiRule("Visible", [])
         result = rule.get_expression(0, True, None, None, None)
         assert result == "ch[0]==1"
+
+    def test_keyword_constructed_rule_arguments(self):
+        """RuleArguments field names must match how MultiRule reads them.
+
+        Built by keyword, initial_value=True must drive "initial_value": "true"
+        and show_on_true=False must produce the inverted expression.
+        """
+        rule = RuleArguments(
+            rule_type="Visible",
+            channel="ca://X",
+            initial_value=True,
+            show_on_true=False,
+            visMin=None,
+            visMax=None,
+        )
+        result = MultiRule("Visible", [rule]).to_string()
+        assert '"initial_value": "true"' in result
+        assert '"expression": "(ch[0]!=1)"' in result
+
+
+@pytest.mark.parametrize("channel", ["ca://X", r"CALC\sum(A:B,C:D)", 'loc://x?init="a"', "tab\there"])
+def test_rule_channels_round_trip_through_json(channel):
+    """Rules are JSON: a backslash, quote or control character in a channel is escaped."""
+    rule = json.loads(f"[{BoolRule('Visible', channel).to_string()}]")[0]
+    assert rule["channels"][0]["channel"] == channel
+    assert rule["name"] == f"Visible_{channel}"
+
+    args = RuleArguments("Visible", channel, False, True, None, None)
+    rule = json.loads(f"[{MultiRule('Visible', [args], hide_on_disconnect_channel=channel).to_string()}]")[0]
+    assert [c["channel"] for c in rule["channels"]] == [channel, channel]
+
+
+def test_escape_qt_mnemonic_basic():
+    assert escape_qt_mnemonic("A & B") == "A && B"
+
+
+def test_escape_qt_mnemonic_idempotent():
+    assert escape_qt_mnemonic("A && B") == "A && B"
+
+
+def test_escape_qt_mnemonic_single_ampersand():
+    assert escape_qt_mnemonic("&") == "&&"
+
+
+def test_escape_qt_mnemonic_empty_string():
+    assert escape_qt_mnemonic("") == ""
+
+
+def test_escape_qt_mnemonic_no_ampersand():
+    assert escape_qt_mnemonic("no amp") == "no amp"
+
+
+def test_escape_qt_mnemonic_none_passthrough():
+    assert escape_qt_mnemonic(None) is None
+
+
+def test_unescape_qt_mnemonic_basic():
+    assert unescape_qt_mnemonic("A && B") == "A & B"
+
+
+def test_unescape_qt_mnemonic_multiple():
+    assert unescape_qt_mnemonic("PLC &&&& X") == "PLC && X"
+
+
+def test_unescape_qt_mnemonic_empty_string():
+    assert unescape_qt_mnemonic("") == ""
+
+
+def test_unescape_qt_mnemonic_no_ampersand():
+    assert unescape_qt_mnemonic("no amp") == "no amp"
+
+
+def test_unescape_qt_mnemonic_none_passthrough():
+    assert unescape_qt_mnemonic(None) is None
+
+
+def test_escape_unescape_round_trip():
+    original = "PLC & UPS"
+    assert unescape_qt_mnemonic(escape_qt_mnemonic(original)) == original
+
+
+def test_rule_notes_are_written():
+    args = RuleArguments("Visible", "X", False, True, None, None)
+    for rule in (BoolRule("Visible", "X", notes='a "note"'), MultiRule("Visible", [args], notes='a "note"')):
+        assert json.loads(rule.to_string())["notes"] == 'a "note"'

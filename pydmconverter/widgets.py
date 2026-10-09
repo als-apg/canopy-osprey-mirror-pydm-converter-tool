@@ -1,6 +1,6 @@
 from xml.etree import ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import Any, ClassVar, List, Optional, Dict, Union
 from pydmconverter.custom_types import RGBA, RuleArguments
 from pydmconverter.widgets_helpers import (
     Int,
@@ -23,9 +23,33 @@ from pydmconverter.widgets_helpers import (
     StringList,
     Row,
     Column,
+    escape_qt_mnemonic,
+    Font,
+    _json_object,
+    _json_text,
 )
 import logging
 from epics import PV
+
+
+def edm_to_ui_filename(file_string: str) -> str:
+    """
+    Map an EDM display name to its converted .ui name.
+
+    A name that is already a ".ui" file is returned unchanged. Otherwise any
+    legacy macro suffix ("name.edl;P=...") is dropped at the first ";", a
+    trailing ".edl" is stripped, and ".ui" is appended. EDM appends ".edl" to a
+    name that lacks the suffix, so "GigE_controls" and "GigE_controls.edl" both
+    become "GigE_controls.ui". Dots anywhere else stay part of the name, so
+    "GigE_v1.2" becomes "GigE_v1.2.ui" and "screen.edl.bak" becomes
+    "screen.edl.bak.ui".
+    """
+    if file_string.endswith(".ui"):
+        return file_string
+    name = file_string.partition(";")[0]
+    if name.endswith(".edl"):
+        name = name[: -len(".edl")]
+    return f"{name}.ui"
 
 
 @dataclass
@@ -394,6 +418,7 @@ class QPushButton(
     icon: Optional[str] = None
     checkable: Optional[bool] = None
     checked: Optional[bool] = None
+    text_has_mnemonics: ClassVar[bool] = True
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -577,7 +602,7 @@ class PyDMPushButton(PyDMPushButtonBase):
         if self.write_when_release is not None:
             properties.append(Bool("writeWhenRelease", self.write_when_release).to_xml())
         if self.on_label is not None:
-            properties.append(Str("text", self.on_label).to_xml())
+            properties.append(Str("text", escape_qt_mnemonic(self.on_label)).to_xml())
         if self.is_freeze_button is not None and not self.is_freeze_button:
             properties.append(Str("pressValue", "1").to_xml())
         if self.is_freeze_button is not None and self.is_freeze_button:
@@ -684,7 +709,7 @@ class PyDMShellCommand(PyDMPushButtonBase, StyleSheetObject):
             properties.append(StringList("commands", self.command).to_xml())
             # Generate titles property if titles is set, otherwise PyDM will use default titles
             if self.titles is not None:
-                properties.append(StringList("titles", self.titles).to_xml())
+                properties.append(StringList("titles", [escape_qt_mnemonic(t) for t in self.titles]).to_xml())
         return properties
 
 
@@ -701,8 +726,8 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
         The filenames associated with the display.
     titles : Optional[str]
         The titles for the display.
-    macros : Optional[str]
-        Macros used for the display.
+    macros : Optional[Union[str, List[str]]]
+        Macros used for the display: one JSON string per filename, by position.
     open_in_new_window : Optional[bool]
         If True, opens the display in a new window.
     follow_symlinks : Optional[bool]
@@ -714,7 +739,7 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
     show_icon: Optional[bool] = None
     filenames: Optional[str] = None
     titles: Optional[str] = None
-    macros: Optional[str] = None
+    macros: Optional[Union[str, List[str]]] = None
     open_in_new_window: Optional[bool] = None
     follow_symlinks: Optional[bool] = None
     displayFileName = None
@@ -737,11 +762,14 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
         #    properties.append(Str("filenames", self.filenames).to_xml()) #TODO: Maybe come back and include this if it comes up in edm
         if self.titles is not None:
             if isinstance(self.titles, list):
-                properties.append(StringList("titles", self.titles).to_xml())
+                properties.append(StringList("titles", [escape_qt_mnemonic(t) for t in self.titles]).to_xml())
             else:
-                properties.append(Str("titles", self.titles).to_xml())
+                properties.append(Str("titles", escape_qt_mnemonic(self.titles)).to_xml())
         if self.macros is not None:
-            properties.append(Str("macros", self.macros).to_xml())
+            if isinstance(self.macros, list):
+                properties.append(StringList("macros", self.macros).to_xml())
+            else:
+                properties.append(Str("macros", self.macros).to_xml())
         # if self.open_in_new_window is not None:
         properties.append(Bool("openInNewWindow", True).to_xml())
         if self.follow_symlinks is not None:
@@ -753,16 +781,11 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
             properties.append(StringList("filenames", converted_filenames).to_xml())
         return properties
 
-    def convert_filetype(self, file_string: str) -> None:
+    def convert_filetype(self, file_string: str) -> str:
         """
-        Converts file strings of .<type> to .ui
+        Converts an EDM display name to its .ui name
         """
-        filearr = file_string.split(".")
-        if len(filearr) > 1:
-            filename = ".".join(filearr[:-1])
-        else:
-            filename = file_string
-        return f"{filename}.ui"
+        return edm_to_ui_filename(file_string)
 
 
 @dataclass
@@ -1204,27 +1227,33 @@ class PyDMEmbeddedDisplay(Alarmable, Hidable, Drawable):
         if self.noscroll is not None:
             scroll: Bool = not self.noscroll
             properties.append(Bool("scrollable", scroll).to_xml())
-        if (
-            self.foreground_color is not None
-            or self.background_color is not None
-            or (isinstance(self.name, str) and self.name.startswith("activePipClass"))
-        ):
-            styles: Dict[str, any] = {}
-            if self.name.startswith("activePipClass"):
-                styles["border"] = "1px solid black"
-            if self.foreground_color is not None:
+        is_pip = isinstance(self.name, str) and self.name.startswith("activePipClass")
+        if self.foreground_color is not None or self.background_color is not None or is_pip:
+            styles: Dict[str, Any] = {}
+            scoped: Dict[str, Dict[str, Any]] = {}
+            if is_pip:
+                # Scoped to this widget: an unscoped border would also frame the
+                # embedded screen's centralwidget and every widget on it.
+                rule: Dict[str, Any] = {"border": "1px solid black"}
+                # EDM fills the frame with bgColor whenever a file is named, even one
+                # that fails to load, and never applies fgColor to the embedded screen.
+                if self.background_color is not None and self.filename:
+                    rule["background-color"] = self.background_color
+                scoped[f"PyDMEmbeddedDisplay#{self.name}"] = rule
+                # The "* { background-color: none; }" StyleSheet adds stops PyDM's
+                # load-error label painting the parent screen's background over it.
+            elif self.foreground_color is not None:
                 styles["color"] = self.foreground_color
             elif self.background_color is not None:
                 styles["background-color"] = self.background_color
-            properties.append(StyleSheet(styles).to_xml())
+            properties.append(StyleSheet(styles, scoped).to_xml())
         return properties
 
-    def convert_filetype(self, file_string: str) -> None:
+    def convert_filetype(self, file_string: str) -> str:
         """
-        Converts file strings of .<type> to .ui
+        Converts an EDM display name to its .ui name
         """
-        filename = ".".join(file_string.split(".")[:-1])
-        return f"{filename}.ui"  # TODO: ask if this should be expanded or be turned into a Path
+        return edm_to_ui_filename(file_string)
 
 
 @dataclass
@@ -1276,8 +1305,20 @@ class QTabWidget(Alarmable):
         The width of the mid-line of the frame.
     disableOnDisconnect : Optional[bool]
         If True, disables the frame on disconnect.
-    tabs : List[str]
-        A list of child tab widgets.
+    font : dict
+        Font for the tab titles.
+    current_index : Optional[int]
+        The tab shown when the display opens.
+    tab_bar_height : Optional[int]
+        Fixed height of the tab bar, in pixels.
+    tab_bar_left : Optional[int]
+        Offset of the first tab from the widget's left edge, in pixels.
+    tab_width : Optional[int]
+        Fixed width of every tab, in pixels (EDM splits the button evenly).
+    foreground_color, background_color, select_color, border_color : Optional[RGBA]
+        Tab text colour, tab colour, the selected tab's colour, and the tab outline.
+    children : List[QWidget]
+        One page per tab.
     """
 
     frameShape: Optional[str] = None
@@ -1286,10 +1327,16 @@ class QTabWidget(Alarmable):
     midLineWidth: Optional[int] = None
     disableOnDisconnect: Optional[bool] = None
 
-    tabs: List[str] = field(default_factory=list)
-    children: List["PyDMFrame"] = field(default_factory=list)
-    embeddedHeight: Optional[int] = None
-    embeddedWidth: Optional[int] = None
+    font: dict = field(default_factory=dict)
+    current_index: Optional[int] = None
+    tab_bar_height: Optional[int] = None
+    tab_bar_left: Optional[int] = None
+    tab_width: Optional[int] = None
+    border_color: Optional[RGBA] = None
+    foreground_color: Optional[RGBA] = None
+    background_color: Optional[RGBA] = None
+    select_color: Optional[RGBA] = None
+    children: List["QWidget"] = field(default_factory=list)
 
     def add_child(self, child) -> None:
         """
@@ -1331,9 +1378,6 @@ class QTabWidget(Alarmable):
         List[ET.Element]
             A list of XML elements representing the properties of this PyDMFrame.
         """
-        if self.embeddedHeight is not None:
-            self.height += self.embeddedHeight
-
         properties: List[ET.Element] = super().generate_properties()
 
         if self.frameShape is not None:
@@ -1346,8 +1390,53 @@ class QTabWidget(Alarmable):
             properties.append(Int("midLineWidth", self.midLineWidth).to_xml())
         if self.disableOnDisconnect is not None:
             properties.append(Bool("disableOnDisconnect", self.disableOnDisconnect).to_xml())
+        if not self.children:
+            return properties
+        if self.font:
+            properties.append(Font(**self.font).to_xml())
+        if self.current_index is not None:
+            properties.append(Int("currentIndex", self.current_index).to_xml())
+        style = self.tab_style_sheet()
+        if style:
+            prop = ET.Element("property", {"name": "styleSheet"})
+            ET.SubElement(prop, "string").text = style
+            properties.append(prop)
 
         return properties
+
+    def tab_style_sheet(self) -> str:
+        """
+        Style the tab bar like the EDM choice button it replaces: fixed height,
+        offset to the button's x, the button's colours, and no frame around the
+        pages so each embedded display sits where the EDM embedded window did.
+        """
+
+        def rgb(color: RGBA) -> str:
+            r, g, b, *_ = color
+            return f"rgb({r}, {g}, {b})"
+
+        tab = []
+        if self.tab_bar_height is not None:
+            # Height and width exclude the 1px border on each side.
+            tab.append(f"height: {max(self.tab_bar_height - 2, 1)}px; padding: 0px; margin: 0px;")
+        if self.tab_width is not None:
+            tab.append(f"width: {max(self.tab_width - 2, 1)}px;")
+        if self.border_color is not None:
+            tab.append(f"border: 1px solid {rgb(self.border_color)};")
+        if self.background_color is not None:
+            tab.append(f"background-color: {rgb(self.background_color)};")
+        if self.foreground_color is not None:
+            tab.append(f"color: {rgb(self.foreground_color)};")
+        rules = []
+        if self.tab_bar_height is not None:
+            rules.append("QTabWidget::pane { border: 0px; top: 0px; }")
+        if self.tab_bar_left:
+            rules.append(f"QTabWidget::tab-bar {{ left: {self.tab_bar_left}px; }}")
+        if tab:
+            rules.append(f"QTabBar::tab {{ {' '.join(tab)} }}")
+        if self.select_color is not None:
+            rules.append(f"QTabBar::tab:selected {{ background-color: {rgb(self.select_color)}; }}")
+        return " ".join(rules)
 
 
 @dataclass
@@ -1382,7 +1471,7 @@ class QWidget(Alarmable):
         if self.title is not None:
             title_element = ET.Element("attribute", name="title")
             title_string_element = ET.Element("string")
-            title_string_element.text = self.title
+            title_string_element.text = escape_qt_mnemonic(self.title)
             title_element.append(title_string_element)
             properties.append(title_element)
 
@@ -1596,7 +1685,7 @@ class PyDMWaveformPlot(Alarmable, StyleSheetObject):
                 "{"
                 '"name": "Axis 1", '
                 '"orientation": "left", '
-                f'"label": "{self.yLabel}", '
+                f'"label": "{_json_text(self.yLabel)}", '
                 f'"minRange": {self.minYRange}, '
                 f'"maxRange": {self.maxYRange}, '
                 f'"autoRange": {self.auto_range}, '
@@ -1646,37 +1735,40 @@ class PyDMWaveformPlot(Alarmable, StyleSheetObject):
         """
         Build JSON-like strings representing individual curve configurations.
 
-        Ensures that the x_channel, y_channel, and plotColor lists are padded
-        to equal length before constructing curve entries.
+        One curve is built per entry of the longest of x_channel, y_channel and
+        plotColor, except that an entry without a y channel plots nothing. A
+        curve missing its x channel leaves it empty, and a curve without a
+        plotColor entry uses the plot's default colour.
 
         Returns
         -------
         List[str]
             A list of JSON-style strings, one for each curve in the plot.
         """
-
-        lists = [self.x_channel, self.y_channel, self.plotColor]
-        max_len = max(len(lst) for lst in lists)
-        for i in range(max_len):
-            if len(self.x_channel) <= i:
-                self.x_channel.append("")
-            if len(self.y_channel) <= i:
-                self.y_channel.append("")
-            if len(self.plotColor) <= i:
-                self.plotColor.append("")
+        # EDM's xyGraph draws a trace with no plotColor entry in palette index 0
+        # (white at SLAC). The palette isn't known here, so use the foreground.
+        default_color = self.color or self.foreground_color or (175, 175, 175, 255)
+        max_len = max(len(self.x_channel), len(self.y_channel), len(self.plotColor))
 
         curve_string_list = []
         for i in range(max_len):
-            curve_string = (
-                "{"
-                f'"name": "", '
-                f'"x_channel": "{self.x_channel[i]}", '
-                f'"y_channel": "{self.y_channel[i]}", '
-                f'"color": "{self.rgba_to_hex(*self.plotColor[i])}", '
-                f'"yAxisName": "Axis 1"'
-                "}"
+            x_channel = self.x_channel[i] if i < len(self.x_channel) else ""
+            y_channel = self.y_channel[i] if i < len(self.y_channel) else ""
+            if not y_channel:
+                # A trace without a yPv (an index the EDM file leaves out) plots nothing.
+                continue
+            color = self.plotColor[i] if i < len(self.plotColor) and self.plotColor[i] else default_color
+            curve_string_list.append(
+                _json_object(
+                    {
+                        "name": "",
+                        "x_channel": x_channel,
+                        "y_channel": y_channel,
+                        "color": self.rgba_to_hex(*color),
+                        "yAxisName": "Axis 1",
+                    }
+                )
             )
-            curve_string_list.append(curve_string)
         return curve_string_list
 
     def rgba_to_hex(self, r, g, b, a=255) -> str:

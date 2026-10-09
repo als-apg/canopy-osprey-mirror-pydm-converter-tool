@@ -1,8 +1,11 @@
+import json
 import xml.etree.ElementTree as ET
 import textwrap
 from pathlib import Path
 
-from pydmconverter.edm.converter import convert, build_customwidgets_element, add_widgets_to_parent
+import pytest
+
+from pydmconverter.edm.converter import convert, build_customwidgets_element, add_widgets_to_parent, content_extent
 from pydmconverter.widgets import PyDMLabel, PyDMFrame
 
 
@@ -124,6 +127,151 @@ def test_convert_with_background_color(tmp_path):
         assert "background-color" in style_string.text, "StyleSheet should contain background-color property"
 
 
+CENTRAL_GEOMETRY_SCREEN = """
+    4 0 1
+    beginScreenProperties
+    x 50
+    y 60
+    w 400
+    h 300
+    bgColor index 14
+    endScreenProperties
+
+    # (Static Text)
+    object activeXTextClass
+    beginObjectProperties
+    major 4
+    minor 1
+    release 1
+    x 10
+    y 10
+    w 100
+    h 20
+    endObjectProperties
+
+    # (Rectangle hidden at startup, near the bottom)
+    object activeRectangleClass
+    beginObjectProperties
+    major 4
+    minor 0
+    release 0
+    x 20
+    y 200
+    w 300
+    h 80
+    visPv "TEST:VIS"
+    visMin "1"
+    visMax "2"
+    endObjectProperties
+"""
+
+OVERFLOW_RECTANGLE = """
+    # (Rectangle extending past the screen's right and bottom edges)
+    object activeRectangleClass
+    beginObjectProperties
+    major 4
+    minor 0
+    release 0
+    x 350
+    y 260
+    w 100
+    h 80
+    endObjectProperties
+"""
+
+
+SCREEN_RECT = {"x": "0", "y": "0", "width": "400", "height": "300"}
+OVERFLOW_RECT = {"x": "0", "y": "0", "width": "450", "height": "340"}
+
+
+def _convert_ui_root(tmp_path, edm_content, scrollable):
+    input_file = tmp_path / "test.edl"
+    output_file = tmp_path / "test.ui"
+    input_file.write_text(textwrap.dedent(edm_content))
+
+    convert(str(input_file), str(output_file), scrollable=scrollable)
+
+    return ET.parse(output_file).getroot()
+
+
+def _geometry_rect(widget):
+    return {child.tag: child.text for child in widget.find("property[@name='geometry']/rect")}
+
+
+def _central_widget_rect(tmp_path, edm_content, scrollable):
+    central_widget = _convert_ui_root(tmp_path, edm_content, scrollable).find(".//widget[@name='centralwidget']")
+    assert central_widget is not None
+
+    properties = central_widget.findall("property")
+    assert properties[0].get("name") == "geometry", "geometry should be centralwidget's first property"
+    return {child.tag: child.text for child in properties[0].find("rect")}
+
+
+@pytest.mark.parametrize("scrollable", [False, True])
+def test_centralwidget_has_screen_geometry(tmp_path, scrollable):
+    """centralwidget is sized to the full screen, not left for Qt to adjustSize().
+
+    Without an explicit geometry, Qt sizes centralwidget to the children visible when
+    the display is first shown, permanently clipping a rule-hidden (visPv) widget that
+    lies below/right of them once it later becomes visible.
+    """
+    rect = _central_widget_rect(tmp_path, CENTRAL_GEOMETRY_SCREEN, scrollable)
+    assert rect == SCREEN_RECT
+
+
+@pytest.mark.parametrize("scrollable", [False, True])
+def test_centralwidget_geometry_covers_widgets_past_screen_size(tmp_path, scrollable):
+    """A widget past the declared screen size grows centralwidget to its right/bottom edge,
+    so it is not clipped when the window is enlarged."""
+    rect = _central_widget_rect(tmp_path, CENTRAL_GEOMETRY_SCREEN + OVERFLOW_RECTANGLE, scrollable)
+    assert rect == OVERFLOW_RECT
+
+
+@pytest.mark.parametrize(
+    "edm_content, content_rect",
+    [(CENTRAL_GEOMETRY_SCREEN, SCREEN_RECT), (CENTRAL_GEOMETRY_SCREEN + OVERFLOW_RECTANGLE, OVERFLOW_RECT)],
+)
+@pytest.mark.parametrize("scrollable", [False, True])
+def test_page_geometry_covers_content(tmp_path, edm_content, content_rect, scrollable):
+    """Form keeps the declared screen size while centralwidget (and, when scrollable,
+    scrollAreaWidgetContents) covers the content, so overflow can be scrolled to."""
+    root = _convert_ui_root(tmp_path, edm_content, scrollable)
+
+    assert _geometry_rect(root.find("widget[@name='Form']")) == SCREEN_RECT
+
+    central_widget = root.find(".//widget[@name='centralwidget']")
+    assert len(central_widget.findall("property[@name='geometry']")) == 1
+    assert _geometry_rect(central_widget) == content_rect
+
+    scroll_contents = root.find(".//widget[@name='scrollAreaWidgetContents']")
+    if scrollable:
+        assert _geometry_rect(root.find(".//widget[@name='scrollArea']")) == SCREEN_RECT
+        assert _geometry_rect(scroll_contents) == content_rect
+    else:
+        assert scroll_contents is None
+
+
+def _widget_with_rect(**parts):
+    widget = ET.Element("widget")
+    rect = ET.SubElement(ET.SubElement(widget, "property", attrib={"name": "geometry"}), "rect")
+    for tag, text in parts.items():
+        ET.SubElement(rect, tag).text = text
+    return widget
+
+
+def test_content_extent_ignores_unparseable_geometry():
+    """A child with an incomplete or non-numeric rect is skipped; float text is truncated."""
+    elements = [
+        _widget_with_rect(x="500", y="500", width="100"),  # height missing
+        _widget_with_rect(x="abc", y="0", width="900", height="900"),
+        ET.Element("widget"),  # no geometry at all
+        _widget_with_rect(x="12.5", y="20", width="100.9", height="30"),
+    ]
+
+    assert content_extent(elements, 100, 40) == (112, 50)
+    assert content_extent([], 400, 300) == (400, 300)
+
+
 def test_convert_with_explicit_color_list(tmp_path, monkeypatch):
     """Test that an explicit color_list_file is used to resolve the screen bgColor."""
     monkeypatch.delenv("EDMCOLORFILE", raising=False)
@@ -211,6 +359,57 @@ def test_convert_explicit_color_list_beats_env(tmp_path, monkeypatch):
     assert "rgba(255, 0, 0, 255)" in style_string.text, (
         f"Expected explicit red palette to beat EDMCOLORFILE yellow, got: {style_string.text}"
     )
+
+
+def test_convert_xy_graph_curves_without_plot_color(tmp_path):
+    """Curves past the end of the plotColor block fall back to the foreground colour
+    instead of failing the conversion."""
+    palette = Path(__file__).parent / "fixtures" / "colors.list"
+    edm_content = textwrap.dedent("""
+        4 0 1
+        beginScreenProperties
+        x 0
+        y 0
+        w 800
+        h 600
+        endScreenProperties
+
+        object xyGraphClass
+        beginObjectProperties
+        major 4
+        minor 8
+        release 0
+        x 10
+        y 10
+        w 400
+        h 300
+        fgColor index 14
+        numTraces 3
+        xPv {
+          0 "X:ZERO"
+          1 "X:ONE"
+        }
+        yPv {
+          0 "Y:ZERO"
+          1 "Y:ONE"
+          2 "Y:TWO"
+        }
+        plotColor {
+          0 index 25
+        }
+        endObjectProperties
+    """)
+
+    input_file = tmp_path / "test.edl"
+    output_file = tmp_path / "test.ui"
+    input_file.write_text(edm_content)
+
+    convert(str(input_file), str(output_file), color_list_file=str(palette))
+
+    assert output_file.exists()
+    curves = ET.parse(output_file).getroot().find(".//property[@name='curves']/stringlist")
+    assert curves is not None
+    assert [json.loads(curve.text)["color"] for curve in curves] == ["#0000ff", "#ffff00", "#ffff00"]
 
 
 def test_build_customwidgets_element():
@@ -373,6 +572,344 @@ def test_convert_related_display_invisible_to_flat(tmp_path):
     assert bool_element.text == "true", "flat property should be set to true when invisible is present"
 
 
+def test_convert_escapes_ampersand_for_qt_mnemonics(tmp_path):
+    """Button-family text/titles get && escaping; QLabel text stays a literal single &."""
+    edm_content = textwrap.dedent("""
+        4 0 1
+        beginScreenProperties
+        major 4
+        minor 0
+        release 1
+        x 0
+        y 0
+        w 800
+        h 600
+        endScreenProperties
+
+        # (Related Display)
+        object relatedDisplayClass
+        beginObjectProperties
+        major 4
+        minor 4
+        release 0
+        x 100
+        y 100
+        w 150
+        h 50
+        fgColor index 14
+        bgColor index 0
+        buttonLabel "PLC & UPS Diagnostics"
+        numPvs 4
+        numDsps 1
+        displayFileName {
+          0 "a.edl"
+        }
+        menuLabel {
+          0 "Sub & Menu"
+        }
+        endObjectProperties
+
+        # (Static Text)
+        object activeXTextClass
+        beginObjectProperties
+        major 4
+        minor 1
+        release 1
+        x 300
+        y 100
+        w 150
+        h 30
+        fgColor index 14
+        value {
+          "Foo & Bar"
+        }
+        endObjectProperties
+    """)
+
+    input_file = tmp_path / "test.edl"
+    output_file = tmp_path / "test.ui"
+    input_file.write_text(edm_content)
+
+    convert(str(input_file), str(output_file))
+
+    assert output_file.exists()
+
+    tree = ET.parse(output_file)
+    root = tree.getroot()
+
+    related_display_buttons = [w for w in root.iter("widget") if w.get("class") == "PyDMRelatedDisplayButton"]
+    assert len(related_display_buttons) == 1, "Should have one PyDMRelatedDisplayButton"
+    button = related_display_buttons[0]
+
+    text_prop = button.find("property[@name='text']")
+    assert text_prop is not None, "Button should have a text property"
+    text_string = text_prop.find("string")
+    assert text_string is not None
+    assert text_string.text == "PLC && UPS Diagnostics"
+
+    # menuLabel is carried through as the PyDM `titles` stringlist (QMenu actions).
+    titles_prop = button.find("property[@name='titles']")
+    assert titles_prop is not None, "Related display should have a titles property"
+    stringlist = titles_prop.find("stringlist")
+    assert stringlist is not None, "titles should be a stringlist"
+    titles = [s.text for s in stringlist.findall("string")]
+    assert titles == ["Sub && Menu"]
+
+    label_widgets = [w for w in root.iter("widget") if w.get("class") in ("PyDMLabel", "QLabel")]
+    assert len(label_widgets) == 1, "Should have one label widget for activeXTextClass"
+    label = label_widgets[0]
+    label_text_prop = label.find("property[@name='text']")
+    assert label_text_prop is not None
+    label_text_string = label_text_prop.find("string")
+    assert label_text_string is not None
+    assert label_text_string.text == "Foo & Bar"
+
+
+def _convert_button_ui(tmp_path, edm_class, blocks):
+    """Convert one ``edm_class`` button carrying ``blocks``; return the .ui path."""
+    edm_content = (
+        textwrap.dedent("""
+        4 0 1
+        beginScreenProperties
+        major 4
+        minor 0
+        release 1
+        x 0
+        y 0
+        w 800
+        h 600
+        endScreenProperties
+
+        object {edm_class}
+        beginObjectProperties
+        major 4
+        minor 4
+        release 0
+        x 100
+        y 100
+        w 150
+        h 50
+        fgColor index 14
+        bgColor index 0
+        buttonLabel "Open"
+        {blocks}
+        endObjectProperties
+    """)
+        .replace("{edm_class}", edm_class)
+        .replace("{blocks}", blocks)
+    )
+    input_file = tmp_path / "test.edl"
+    output_file = tmp_path / "test.ui"
+    input_file.write_text(edm_content)
+
+    convert(str(input_file), str(output_file))
+    return output_file
+
+
+def _convert_button(tmp_path, edm_class, pydm_class, blocks):
+    """Convert one ``edm_class`` button carrying ``blocks``; return its ``pydm_class`` widget element."""
+    output_file = _convert_button_ui(tmp_path, edm_class, blocks)
+    (button,) = [w for w in ET.parse(output_file).getroot().iter("widget") if w.get("class") == pydm_class]
+    return button
+
+
+def _convert_related_display(tmp_path, blocks, num_dsps=2):
+    """Convert one relatedDisplayClass carrying ``blocks``; return the .ui path."""
+    return _convert_button_ui(tmp_path, "relatedDisplayClass", f"numDsps {num_dsps}\n{blocks}")
+
+
+def _stringlist(widget, name):
+    """``widget``'s stringlist property ``name`` ("" for an empty entry), or None without one."""
+    stringlist = widget.find(f"property[@name='{name}']/stringlist")
+    if stringlist is None:
+        return None
+    return [s.text or "" for s in stringlist.findall("string")]
+
+
+def _related_display_macros_and_filenames(tmp_path, blocks, num_dsps=2):
+    """Convert one relatedDisplayClass carrying ``blocks``; return its (macros, filenames)."""
+    button = _convert_button(
+        tmp_path, "relatedDisplayClass", "PyDMRelatedDisplayButton", f"numDsps {num_dsps}\n{blocks}"
+    )
+    macros_prop = button.find("property[@name='macros']")
+    macros = None if macros_prop is None else [s.text for s in macros_prop.findall("stringlist/string")]
+    filenames = [s.text for s in button.findall("property[@name='filenames']/stringlist/string")]
+    return macros, filenames
+
+
+def _related_display_titles_and_filenames(tmp_path, blocks):
+    """Convert one relatedDisplayClass carrying ``blocks``; return its (titles, filenames)."""
+    button = _convert_button(tmp_path, "relatedDisplayClass", "PyDMRelatedDisplayButton", blocks)
+    return _stringlist(button, "titles"), _stringlist(button, "filenames")
+
+
+def test_convert_related_display_pairs_symbols_with_filenames_by_index(tmp_path):
+    """symbols { 1 "P=X" } belongs to displayFileName 1, not to display 0."""
+    macros, filenames = _related_display_macros_and_filenames(
+        tmp_path,
+        'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n}\nsymbols {\n  1 "P=X"\n}',
+    )
+    assert filenames == ["a.ui", "b.ui"]
+    assert macros == ["{}", '{"P": "X"}']
+
+
+def test_convert_related_display_dense_symbols_unchanged(tmp_path):
+    macros, filenames = _related_display_macros_and_filenames(
+        tmp_path,
+        'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n}\nsymbols {\n  0 "P=A"\n  1 "P=B"\n}',
+    )
+    assert filenames == ["a.ui", "b.ui"]
+    assert macros == ['{"P": "A"}', '{"P": "B"}']
+
+
+def test_convert_related_display_macros_stringlist_pads_trailing_entries(tmp_path):
+    """macros is a <stringlist> with one entry per filename, even past the last symbols entry."""
+    macros, filenames = _related_display_macros_and_filenames(
+        tmp_path,
+        'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n  2 "c.edl"\n}\nsymbols {\n  0 "P=A"\n}',
+        num_dsps=3,
+    )
+    assert filenames == ["a.ui", "b.ui", "c.ui"]
+    assert macros == ['{"P": "A"}', "{}", "{}"]
+
+
+def test_convert_related_display_single_file_macros_stringlist(tmp_path):
+    macros, filenames = _related_display_macros_and_filenames(
+        tmp_path, 'displayFileName {\n  0 "a.edl"\n}\nsymbols {\n  0 "P=A,R=B"\n}', num_dsps=1
+    )
+    assert filenames == ["a.ui"]
+    assert macros == ['{"P": "A", "R": "B"}']
+
+
+def test_related_display_macros_load_one_per_filename_in_pydm(tmp_path, qtbot):
+    """PyDM pairs macros[i] with filenames[i]; a single <string> would load as one entry."""
+    pytest.importorskip("pydm")
+    from pydm.utilities.macro import parse_macro_string
+    from pydm.widgets.related_display_button import PyDMRelatedDisplayButton
+    from qtpy import uic
+
+    output_file = _convert_related_display(
+        tmp_path,
+        'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n  2 "c.edl"\n}\n'
+        'symbols {\n  1 "DEV=QUAD:L1B:0385,PDEV=PSC:L1B:MG04"\n  2 "DEV=XCOR:L1B:0385"\n}',
+        num_dsps=3,
+    )
+    screen = uic.loadUi(str(output_file))
+    qtbot.addWidget(screen)
+    (button,) = screen.findChildren(PyDMRelatedDisplayButton)
+
+    assert button.filenames == ["a.ui", "b.ui", "c.ui"]
+    assert len(button.macros) == len(button.filenames)
+    assert [parse_macro_string(m) for m in button.macros] == [
+        {},
+        {"DEV": "QUAD:L1B:0385", "PDEV": "PSC:L1B:MG04"},
+        {"DEV": "XCOR:L1B:0385"},
+    ]
+
+
+# b.edl has an empty symbols entry and c.edl none (index 2 is skipped).
+FOUR_DISPLAYS = (
+    'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n  2 "c.edl"\n  3 "d.edl"\n}\n'
+    'symbols {\n  0 "DEV=A1"\n  1 ""\n  3 "DEV=D4,N=2"\n}'
+)
+
+
+def test_convert_related_display_macros_keep_empty_and_skipped_entries(tmp_path):
+    macros, filenames = _related_display_macros_and_filenames(tmp_path, FOUR_DISPLAYS, num_dsps=4)
+    assert filenames == ["a.ui", "b.ui", "c.ui", "d.ui"]
+    assert macros == ['{"DEV": "A1"}', "{}", "{}", '{"DEV": "D4", "N": "2"}']
+
+
+def test_related_display_opens_each_file_with_its_own_macros(tmp_path, qtbot):
+    """Opening each entry through PyDM gives that display its own symbols."""
+    pytest.importorskip("pydm")
+    from pydm.display import load_file
+    from pydm.widgets.related_display_button import PyDMRelatedDisplayButton
+
+    output_file = _convert_related_display(tmp_path, FOUR_DISPLAYS, num_dsps=4)
+    for name in "abcd":
+        (tmp_path / f"{name}.ui").write_text(
+            '<ui version="4.0"><class>Form</class><widget class="QWidget" name="Form"/></ui>'
+        )
+    screen = load_file(str(output_file), target=None)
+    qtbot.addWidget(screen)
+    (button,) = screen.findChildren(PyDMRelatedDisplayButton)
+
+    opened = {}
+    for item in button._get_items():
+        display = button.open_display(item["filename"], item["macros"])
+        qtbot.addWidget(display)
+        opened[item["filename"]] = display.macros()
+    assert opened == {"a.ui": {"DEV": "A1"}, "b.ui": {}, "c.ui": {}, "d.ui": {"DEV": "D4", "N": "2"}}
+
+
+def test_convert_related_display_pairs_menu_labels_with_filenames_by_index(tmp_path):
+    """menuLabel { 1 .. 3 } labels displayFileName 1..3; display 0 keeps EDM's empty label.
+
+    The shape of lerf/mgnt_l1b_main.edl's "EPSC Hardware..." button: compacting
+    the labels handed display 0 the label of display 1, and so on.
+    """
+    titles, filenames = _related_display_titles_and_filenames(
+        tmp_path,
+        "displayFileName {\n"
+        + "".join(f'  {i} "mgnt_epsc"\n' for i in range(4))
+        + '}\nmenuLabel {\n  1 "QCM03"\n  2 "XCM03"\n  3 "YCM03"\n}',
+    )
+    assert filenames == ["mgnt_epsc.ui"] * 4
+    assert titles == ["", "QCM03", "XCM03", "YCM03"]
+
+
+def test_convert_related_display_dense_menu_labels_unchanged(tmp_path):
+    titles, filenames = _related_display_titles_and_filenames(
+        tmp_path,
+        'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n}\nmenuLabel {\n  0 "A"\n  1 "B"\n}',
+    )
+    assert filenames == ["a.ui", "b.ui"]
+    assert titles == ["A", "B"]
+
+
+def test_convert_related_display_menu_labels_follow_filename_order(tmp_path):
+    """Titles follow the filenames' own indices, so a gap in both stays aligned and a
+    trailing display with no label gets an empty title rather than none."""
+    titles, filenames = _related_display_titles_and_filenames(
+        tmp_path,
+        'displayFileName {\n  1 "a.edl"\n  3 "b.edl"\n  4 "c.edl"\n}\nmenuLabel {\n  1 "A"\n  3 "B"\n}',
+    )
+    assert filenames == ["a.ui", "b.ui", "c.ui"]
+    assert titles == ["A", "B", ""]
+
+
+def test_convert_related_display_placeholder_menu_label_keeps_its_slot(tmp_path):
+    """A \\x18 label is no label: it holds its display's slot instead of being dropped."""
+    titles, _ = _related_display_titles_and_filenames(
+        tmp_path,
+        'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n}\nmenuLabel {\n  0 "\x18"\n  1 "B"\n}',
+    )
+    assert titles == ["", "B"]
+
+
+@pytest.mark.parametrize("labels", ['menuLabel {\n  0 "\x18"\n}', 'menuLabel {\n  1 "\x18"\n}'])
+def test_convert_related_display_without_labels_has_no_titles(tmp_path, labels):
+    """With no real label PyDM's default titles (the filenames) stand."""
+    titles, filenames = _related_display_titles_and_filenames(
+        tmp_path, 'displayFileName {\n  0 "a.edl"\n  1 "b.edl"\n}\n' + labels
+    )
+    assert filenames == ["a.ui", "b.ui"]
+    assert titles is None
+
+
+def test_convert_shell_command_pairs_command_labels_with_commands_by_index(tmp_path):
+    """commandLabel { 1 .. } labels command 1 on (shell_cmd.cc pairs them by index)."""
+    button = _convert_button(
+        tmp_path,
+        "shellCmdClass",
+        "PyDMShellCommand",
+        'numCmds 3\ncommand {\n  0 "echo a"\n  1 "echo b"\n  2 "echo c"\n}\ncommandLabel {\n  1 "B"\n  2 "C"\n}',
+    )
+    assert _stringlist(button, "commands") == ["echo a", "echo b", "echo c"]
+    assert _stringlist(button, "titles") == ["", "B", "C"]
+
+
 def test_convert_shell_command_to_commands_property(tmp_path):
     """Test that EDM shellCmdClass command property maps to PyDM commands property."""
     edm_content = textwrap.dedent("""
@@ -527,3 +1064,58 @@ def test_convert_meter_widget(tmp_path):
     show_units = widget.find("property[@name='showUnits']")
     assert show_units is not None, "Widget should have showUnits property"
     assert show_units.find("bool").text == "true"
+
+
+@pytest.mark.parametrize("on_label, off_label, buttons", [("Cancel ", "Cancel", 1), ("Open", "Cancel", 2)])
+def test_message_button_off_variant_ignores_label_padding(tmp_path, on_label, off_label, buttons):
+    """Labels that differ only in padding (xray/vac_iso_valve.edl) get no separate off button."""
+    edm_content = textwrap.dedent(f"""
+        4 0 1
+        beginScreenProperties
+        major 4
+        minor 0
+        release 1
+        x 0
+        y 0
+        w 200
+        h 100
+        endScreenProperties
+
+        object activeMessageButtonClass
+        beginObjectProperties
+        major 4
+        minor 0
+        release 0
+        x 10
+        y 10
+        w 80
+        h 20
+        controlPv "X:BYPASS"
+        pressValue "0"
+        onLabel "{on_label}"
+        offLabel "{off_label}"
+        endObjectProperties
+    """)
+    input_file = tmp_path / "button.edl"
+    output_file = tmp_path / "button.ui"
+    input_file.write_text(edm_content)
+
+    convert(str(input_file), str(output_file))
+
+    widgets = ET.parse(output_file).getroot().iter("widget")
+    assert sum(widget.get("class") == "PyDMPushButton" for widget in widgets) == buttons
+
+
+def test_convert_warns_when_a_shell_variable_shares_a_macro_name(tmp_path, caplog):
+    r"""camac/camac_lu_from_epics_detail.edl: $\{LOCA\} (a shell variable) next to the
+    $(LOCA) macro. Both read as ${LOCA}, which PyDM substitutes."""
+    source = tmp_path / "shell.edl"
+    source.write_text(
+        "4 0 1\nbeginScreenProperties\nmajor 4\nminor 0\nrelease 1\nx 0\ny 0\nw 200\nh 100\nendScreenProperties\n\n"
+        "object shellCmdClass\nbeginObjectProperties\nmajor 4\nminor 2\nrelease 0\nx 10\ny 10\nw 100\nh 30\n"
+        'numCmds 1\ncommand {\n  0 "luCWRestart $\\{LOCA\\} $(LOCA) $\\{HOME\\}"\n}\nendObjectProperties\n'
+    )
+    convert(str(source), str(tmp_path / "shell.ui"))
+    assert "luCWRestart ${LOCA} ${LOCA} ${HOME}" in (tmp_path / "shell.ui").read_text()
+    (warning,) = [r.getMessage() for r in caplog.records if "shares its name with a macro" in r.getMessage()]
+    assert warning.endswith(": LOCA")
