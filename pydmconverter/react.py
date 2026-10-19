@@ -57,10 +57,11 @@ def convert_to_ir(
     ``search_paths`` (``.edl`` inputs only) are extra directories (a single directory
     or a sequence) searched, like ``EDMDATAFILES``, for symbol files and ``calc.list``.
     ``confine_file_refs`` is for untrusted input: file names taken from it (``.edl``
-    symbol files, a ``.ui`` PyDMTemplateRepeater's ``dataSource``/``templateFilename``)
-    are read only from inside the file's own directory or, for ``.edl``,
-    ``search_paths``, never ``EDMDATAFILES`` (see :func:`convert_bytes`,
-    :func:`edm_file_to_ir` and :func:`ui_file_to_ir`).
+    symbol files, a ``.ui`` PyDMTemplateRepeater's ``dataSource``/``templateFilename``,
+    a ``.bob`` script or execute-action ``file``) are read only from inside the file's
+    own directory or, for ``.edl``, ``search_paths``, never ``EDMDATAFILES`` (see
+    :func:`convert_bytes`, :func:`edm_file_to_ir`, :func:`ui_file_to_ir` and
+    :func:`bob_file_to_ir`).
     """
     suffix = Path(input_path).suffix.lower()
     adapter = _ADAPTERS.get(suffix)
@@ -78,7 +79,13 @@ def convert_to_ir(
             scheme=scheme,
         )
     elif suffix == ".bob":
-        ir = bob_file_to_ir(input_path, registry=registry, color_def_path=color_def_path, scheme=scheme)
+        ir = bob_file_to_ir(
+            input_path,
+            registry=registry,
+            color_def_path=color_def_path,
+            scheme=scheme,
+            confine_file_refs=confine_file_refs,
+        )
     else:
         ir = ui_file_to_ir(input_path, registry=registry, confine_file_refs=confine_file_refs)
     # Stamp here, the one point every entry point flows through, so callers that take the ScreenIR (not the
@@ -137,6 +144,9 @@ def convert_bytes(
     - ``kind="ui"``: a PyDMTemplateRepeater's ``dataSource`` and ``templateFilename``
       must resolve inside the staged file's directory, which holds only the upload,
       so in practice the repeater becomes a placeholder with a warning.
+    - ``kind="bob"``: a ``<script file=...>`` or execute-action script ``file`` is read
+      only if it resolves inside the staged file's directory; any other name is carried
+      as its path, never read, with a warning on its node.
 
     ``color_list_path`` (``kind="edl"`` only) points at an EDM ``colors.list`` palette
     used to resolve "index N" color props; when omitted it falls back to the

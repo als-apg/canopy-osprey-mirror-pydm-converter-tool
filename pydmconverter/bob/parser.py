@@ -27,6 +27,8 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydmconverter.edm.parser_helpers import resolve_inside
+
 __all__ = [
     "BobAction",
     "BobDisplay",
@@ -45,6 +47,21 @@ _STRUCTURAL_TAGS = frozenset({"widget", "name", "macros", "rules", "scripts", "a
 
 # Script ``file`` markers for inline scripts (Phoebus and BOY spellings).
 EMBEDDED_SCRIPT_FILES = frozenset({"EmbeddedPy", "EmbeddedJs", "EmbeddedPython", "EmbeddedJavaScript"})
+
+
+def script_file_path(base_dir: Path | None, file: str, *, confine: bool) -> Path | None:
+    """Where a script or execute-action file named by a display may be read, or None.
+
+    None for an inline marker or a display with no directory. With ``confine`` (untrusted
+    input) also None for a name that resolves outside ``base_dir``: absolute, ``..`` or a
+    symlink out, so an upload cannot make the converter read the server's files.
+    """
+    if base_dir is None or not file or file in EMBEDDED_SCRIPT_FILES:
+        return None
+    if confine:
+        return resolve_inside(base_dir, file, [base_dir.resolve()])
+    return base_dir / file
+
 
 _PV_NAME_MACRO_RE = re.compile(r"\$\(pv_name\)|\$\{pv_name\}")
 
@@ -126,9 +143,11 @@ def walk_widgets(widgets: Iterable[BobWidget]) -> Iterator[BobWidget]:
         yield from walk_widgets(widget.children)
 
 
-def parse_bob(path_or_bytes: str | Path | bytes) -> BobDisplay:
+def parse_bob(path_or_bytes: str | Path | bytes, *, confine_file_refs: bool = False) -> BobDisplay:
     """Parse a ``.bob``/``.opi`` file path or raw XML bytes into a ``BobDisplay``.
 
+    ``confine_file_refs`` is for untrusted input: a ``<script file=...>`` is read only
+    when it resolves inside the display's directory (see :func:`script_file_path`).
     Raises ``BobParseError`` on malformed XML or a root that is not ``<display>``.
     """
     path: Path | None = None
@@ -149,7 +168,7 @@ def parse_bob(path_or_bytes: str | Path | bytes) -> BobDisplay:
     return BobDisplay(
         name=_child_text(root, "name"),
         props=_props(root),
-        widgets=[_widget(w, base_dir) for w in root.findall("widget")],
+        widgets=[_widget(w, base_dir, confine_file_refs) for w in root.findall("widget")],
         macros=_macros(root.find("macros")),
         path=path,
     )
@@ -219,7 +238,7 @@ def _rule(el: ET.Element) -> BobRule:
     )
 
 
-def _script(el: ET.Element, base_dir: Path | None) -> BobScript:
+def _script(el: ET.Element, base_dir: Path | None, confine: bool) -> BobScript:
     file = el.get("file")
     if file is None:  # BOY: <path pathString="..."/>
         path_el = el.find("path")
@@ -228,14 +247,13 @@ def _script(el: ET.Element, base_dir: Path | None) -> BobScript:
     if text_el is None:
         text_el = el.find("scriptText")
     text: str | None = text_el.text if text_el is not None else None
-    if text is None and file and file not in EMBEDDED_SCRIPT_FILES and base_dir is not None:
-        candidate = base_dir / file
-        if candidate.is_file():
-            text = candidate.read_text(encoding="utf-8", errors="replace")
+    candidate = script_file_path(base_dir, file, confine=confine)
+    if text is None and candidate is not None and candidate.is_file():
+        text = candidate.read_text(encoding="utf-8", errors="replace")
     return BobScript(name=el.get("name", ""), file=file, text=text, pvs=_pvs(el))
 
 
-def _widget(el: ET.Element, base_dir: Path | None) -> BobWidget:
+def _widget(el: ET.Element, base_dir: Path | None, confine: bool) -> BobWidget:
     type_id = el.get("typeId")
     props = _props(el)
     props.setdefault("x", "0")
@@ -248,9 +266,9 @@ def _widget(el: ET.Element, base_dir: Path | None) -> BobWidget:
         type=el.get("type") or type_id or "",
         name=_child_text(el, "name"),
         props=props,
-        children=[_widget(c, base_dir) for c in el.findall("widget")],
+        children=[_widget(c, base_dir, confine) for c in el.findall("widget")],
         rules=[_rule(r) for r in rules_el.findall("rule")] if rules_el is not None else [],
-        scripts=[_script(s, base_dir) for s in scripts_el.findall("script")] if scripts_el is not None else [],
+        scripts=[_script(s, base_dir, confine) for s in scripts_el.findall("script")] if scripts_el is not None else [],
         actions=[_action(a) for a in actions_el.findall("action")] if actions_el is not None else [],
         macros=_macros(el.find("macros")),
         type_id=type_id,
