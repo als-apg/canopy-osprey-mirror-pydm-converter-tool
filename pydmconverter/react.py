@@ -57,10 +57,11 @@ def convert_to_ir(
     ``search_paths`` (``.edl`` inputs only) are extra directories (a single directory
     or a sequence) searched, like ``EDMDATAFILES``, for symbol files and ``calc.list``.
     ``confine_file_refs`` is for untrusted input: file names taken from it (``.edl``
-    symbol files, a ``.ui`` PyDMTemplateRepeater's ``dataSource``/``templateFilename``)
-    are read only from inside the file's own directory or, for ``.edl``,
-    ``search_paths``, never ``EDMDATAFILES`` (see :func:`convert_bytes`,
-    :func:`edm_file_to_ir` and :func:`ui_file_to_ir`).
+    symbol files, a ``.ui`` PyDMTemplateRepeater's ``dataSource``/``templateFilename``,
+    a ``.bob`` script or execute-action ``file``) are read only from inside the file's
+    own directory or, for ``.edl``, ``search_paths``, never ``EDMDATAFILES`` (see
+    :func:`convert_bytes`, :func:`edm_file_to_ir`, :func:`ui_file_to_ir` and
+    :func:`bob_file_to_ir`).
     """
     suffix = Path(input_path).suffix.lower()
     adapter = _ADAPTERS.get(suffix)
@@ -78,7 +79,13 @@ def convert_to_ir(
             scheme=scheme,
         )
     elif suffix == ".bob":
-        ir = bob_file_to_ir(input_path, registry=registry, color_def_path=color_def_path, scheme=scheme)
+        ir = bob_file_to_ir(
+            input_path,
+            registry=registry,
+            color_def_path=color_def_path,
+            scheme=scheme,
+            confine_file_refs=confine_file_refs,
+        )
     else:
         ir = ui_file_to_ir(input_path, registry=registry, confine_file_refs=confine_file_refs)
     # Stamp here, the one point every entry point flows through, so callers that take the ScreenIR (not the
@@ -99,7 +106,7 @@ def convert_bytes(
     scheme: SchemeResult | None = None,
     filename: str | None = None,
     search_paths: SearchPaths = None,
-    confine_file_refs: bool = False,
+    confine_file_refs: bool = True,
 ) -> ScreenIR:
     """Parse raw ``.edl``/``.ui``/``.bob`` bytes into a Screen IR, keyed on ``kind``.
 
@@ -119,10 +126,11 @@ def convert_bytes(
     siblings of the original file are only found through here (e.g. the directory of
     an extracted archive).
 
-    ``confine_file_refs`` should be set when ``data`` is untrusted, e.g. a user upload.
-    File names inside the input come verbatim from the bytes, so by default an absolute
-    name or ``..`` can read any file the process can reach and inline it into the
-    returned IR. With the flag on:
+    ``confine_file_refs`` is on by default, because ``data`` is usually untrusted (a
+    user upload). File names inside the input come verbatim from the bytes, so without
+    it an absolute name or ``..`` can read any file the process can reach and inline it
+    into the returned IR. Pass ``False`` only for trusted input that needs EDM's own
+    lookups (``EDMDATAFILES``, the CWD). With the flag on:
 
     - ``kind="edl"``: an activeSymbolClass ``file`` is read only if it resolves inside
       the private staging dir or one of ``search_paths`` (any of them: a
@@ -136,6 +144,9 @@ def convert_bytes(
     - ``kind="ui"``: a PyDMTemplateRepeater's ``dataSource`` and ``templateFilename``
       must resolve inside the staged file's directory, which holds only the upload,
       so in practice the repeater becomes a placeholder with a warning.
+    - ``kind="bob"``: a ``<script file=...>`` or execute-action script ``file`` is read
+      only if it resolves inside the staged file's directory; any other name is carried
+      as its path, never read, with a warning on its node.
 
     ``color_list_path`` (``kind="edl"`` only) points at an EDM ``colors.list`` palette
     used to resolve "index N" color props; when omitted it falls back to the

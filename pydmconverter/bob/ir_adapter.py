@@ -181,6 +181,7 @@ class _File:
     named: dict[str, RGBA] | None
     script_ctx: ScriptFileContext
     base_dir: Path | None
+    confine_file_refs: bool
     declarer_warnings: dict[str, list[str]] = field(default_factory=dict)
     targets: dict[str, _Target] = field(default_factory=dict)
     color: ColorContext | None = None
@@ -347,6 +348,8 @@ class _WidgetLowering:
             self.action_ctx.carried,
             self.declined,
             base_dir=self.state.base_dir,
+            confine_file_refs=self.state.confine_file_refs,
+            warn=self.warn,
         )
         if self.unknown:
             qt_class, registry_id = None, None
@@ -708,6 +711,7 @@ def _display_to_ir(
     registry: RegistryClient | None,
     color_def_path: str | Path | None,
     scheme: SchemeResult | None = None,
+    confine_file_refs: bool = False,
 ) -> ScreenIR:
     registry = registry or VendoredRegistry()
     builder = IRBuilder(registry)
@@ -723,6 +727,7 @@ def _display_to_ir(
         named=named,
         script_ctx=ScriptFileContext(writers=build_writer_census(display.widgets)),
         base_dir=display.path.parent if display.path is not None else None,
+        confine_file_refs=confine_file_refs,
         color=color,
     )
     for message in declarer_warnings:
@@ -775,6 +780,7 @@ def bob_file_to_ir(
     registry: RegistryClient | None = None,
     color_def_path: str | Path | None = None,
     scheme: SchemeResult | None = None,
+    confine_file_refs: bool = False,
 ) -> ScreenIR:
     """Parse a Phoebus ``.bob`` file and build its Screen IR.
 
@@ -784,12 +790,19 @@ def bob_file_to_ir(
     (:func:`~pydmconverter.bob.colors.named_color`); ``None`` keeps today's literal hex. ``registry`` defaults to the vendored
     widget registry. The screen id and title are the file stem. Raises
     :class:`~pydmconverter.bob.parser.BobParseError` on malformed XML; every other
-    problem becomes a warning on the node it concerns.
+    problem becomes a warning on the node it concerns. ``confine_file_refs`` is for
+    untrusted input: a script or execute-action file is read only when it resolves inside
+    the file's directory, and every one refused is a warning on its node.
     """
     source = Path(path)
-    display = parse_bob(source)
+    display = parse_bob(source, confine_file_refs=confine_file_refs)
     return _display_to_ir(
-        display, screen_id=source.stem, registry=registry, color_def_path=color_def_path, scheme=scheme
+        display,
+        screen_id=source.stem,
+        registry=registry,
+        color_def_path=color_def_path,
+        scheme=scheme,
+        confine_file_refs=confine_file_refs,
     )
 
 
