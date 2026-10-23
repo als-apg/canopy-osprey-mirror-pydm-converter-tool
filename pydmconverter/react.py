@@ -42,6 +42,7 @@ def convert_to_ir(
     scheme: SchemeResult | None = None,
     search_paths: SearchPaths = None,
     confine_file_refs: bool = False,
+    display_roots: SearchPaths = None,
 ) -> ScreenIR:
     """Parse an ``.edl``, ``.ui`` or ``.bob`` file into a Screen IR, dispatching by suffix.
 
@@ -62,8 +63,13 @@ def convert_to_ir(
     own directory or, for ``.edl``, ``search_paths``, never ``EDMDATAFILES`` (see
     :func:`convert_bytes`, :func:`edm_file_to_ir`, :func:`ui_file_to_ir` and
     :func:`bob_file_to_ir`).
+
+    ``display_roots`` (``.edl`` inputs only) are absolute directories whose display
+    names become root-relative (see :mod:`pydmconverter.edm.display_roots`); when
+    omitted they come from the ``PYDMCONVERTER_DISPLAY_ROOTS`` env var.
     """
-    suffix = Path(input_path).suffix.lower()
+    # By name, not Path.suffix, which is "" for a file named just ".edl".
+    suffix = next((s for s in _ADAPTERS if Path(input_path).name.lower().endswith(s)), Path(input_path).suffix.lower())
     adapter = _ADAPTERS.get(suffix)
     if adapter is None:
         raise ValueError(f"--target react supports {', '.join(SUPPORTED_SUFFIXES)} inputs, not {suffix!r}")
@@ -77,6 +83,7 @@ def convert_to_ir(
             search_paths=search_paths,
             confine_file_refs=confine_file_refs,
             scheme=scheme,
+            display_roots=display_roots,
         )
     elif suffix == ".bob":
         ir = bob_file_to_ir(
@@ -107,6 +114,7 @@ def convert_bytes(
     filename: str | None = None,
     search_paths: SearchPaths = None,
     confine_file_refs: bool = True,
+    display_roots: SearchPaths = None,
 ) -> ScreenIR:
     """Parse raw ``.edl``/``.ui``/``.bob`` bytes into a Screen IR, keyed on ``kind``.
 
@@ -154,6 +162,10 @@ def convert_bytes(
     ``color_def_path`` (``kind="bob"`` only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
     ``scheme`` is a flattened colour scheme; see :func:`convert_to_ir`.
+
+    ``display_roots`` (``kind="edl"`` only) are absolute directories whose display
+    names become root-relative (see :mod:`pydmconverter.edm.display_roots`); when
+    omitted they come from the ``PYDMCONVERTER_DISPLAY_ROOTS`` env var.
     """
     if kind not in ("edl", "ui", "bob"):
         raise ValueError(f"convert_bytes kind must be 'edl', 'ui' or 'bob', not {kind!r}")
@@ -182,6 +194,7 @@ def convert_bytes(
             scheme=scheme,
             search_paths=search_paths,
             confine_file_refs=confine_file_refs,
+            display_roots=display_roots,
         )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -217,6 +230,7 @@ def convert_file(
     site: str | None = None,
     color_def_path: str | Path | None = None,
     scheme: SchemeResult | None = None,
+    display_roots: SearchPaths = None,
 ) -> Path:
     """Convert one ``.edl``/``.ui``/``.bob`` file to ``*.screen.json``; return the output path.
 
@@ -226,6 +240,10 @@ def convert_file(
     ``color_def_path`` (``.bob`` inputs only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
     ``scheme`` is a flattened colour scheme; see :func:`convert_to_ir`.
+
+    ``display_roots`` (``.edl`` inputs only) are absolute directories whose display
+    names become root-relative (see :mod:`pydmconverter.edm.display_roots`); when
+    omitted they come from the ``PYDMCONVERTER_DISPLAY_ROOTS`` env var.
     """
     inp = Path(input_path)
     out = _screen_json_path(inp, Path(output_path))
@@ -240,6 +258,7 @@ def convert_file(
             site=site,
             color_def_path=color_def_path,
             scheme=scheme,
+            display_roots=display_roots,
         ),
         out,
     )
@@ -256,6 +275,7 @@ def convert_folder(
     site: str | None = None,
     color_def_path: str | Path | None = None,
     scheme: SchemeResult | None = None,
+    display_roots: SearchPaths = None,
 ) -> tuple[int, list[str]]:
     """Recursively convert every ``.edl``/``.ui``/``.bob`` under ``input_dir``.
 
@@ -267,13 +287,18 @@ def convert_folder(
     ``color_def_path`` (``.bob`` inputs only) names a Phoebus ``color.def`` whose entries
     overlay the built-in named colours; when omitted only the built-in names resolve.
     ``scheme`` is a flattened colour scheme; see :func:`convert_to_ir`.
+
+    ``display_roots`` (``.edl`` inputs only) are absolute directories whose display
+    names become root-relative (see :mod:`pydmconverter.edm.display_roots`); when
+    omitted they come from the ``PYDMCONVERTER_DISPLAY_ROOTS`` env var.
     """
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     found = 0
     failed: list[str] = []
     for source in sorted(input_dir.rglob("*")):
-        if not source.is_file() or source.suffix.lower() not in _ADAPTERS:
+        # By name, as in convert_to_ir: a file named just ".edl" has no Path.suffix.
+        if not source.is_file() or not source.name.lower().endswith(SUPPORTED_SUFFIXES):
             continue
         found += 1
         relative = source.relative_to(input_dir)
@@ -292,6 +317,7 @@ def convert_folder(
                     site=site,
                     color_def_path=color_def_path,
                     scheme=scheme,
+                    display_roots=display_roots,
                 ),
                 out,
             )

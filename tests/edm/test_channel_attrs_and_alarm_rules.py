@@ -2,6 +2,8 @@
 (controlPv/indicatorPv split instead of last-wins funneling), alarmPv-driven
 alarm-color rules, and closed/filled activeLineClass -> polygon."""
 
+import pytest
+
 from pydmconverter.edm.edm_qt import has_pv, resolve_qt_class
 from pydmconverter.edm.ir_adapter import (
     _alarm_rules,
@@ -10,8 +12,11 @@ from pydmconverter.edm.ir_adapter import (
     _fixup_state_button,
     _object_to_source,
     _severity_channel,
+    edm_file_to_ir,
 )
 from pydmconverter.edm.parser import EDMObject
+from pydmconverter.ir.emit import to_wire_dict
+from pydmconverter.ir.schema import validate_screen_json
 
 
 def _obj(name, properties, w=10, h=10):
@@ -37,16 +42,16 @@ def test_two_channel_button_keeps_control_as_channel_and_maps_readback():
     assert warnings == []
 
 
-def test_menu_button_maps_indicator_to_readback():
+def test_menu_button_control_wins_and_indicator_drop_is_loud():
+    """The menu button's combo box has no readback (#233)."""
     qt_props, warnings = {}, []
     obj = _obj(
         "activeMenuButtonClass",
         {"controlPv": "CAMR:X:Acquire", "indicatorPv": "CAMR:X:DetectorState_RBV"},
     )
     _apply_channel_attrs(obj, qt_props, warnings)
-    assert qt_props["channel"] == "CAMR:X:Acquire"
-    assert qt_props["readbackChannel"] == "CAMR:X:DetectorState_RBV"
-    assert warnings == []
+    assert qt_props == {"channel": "CAMR:X:Acquire"}
+    assert warnings == ["EDM indicatorPv readback dropped (controlPv kept as the channel)"]
 
 
 def test_choice_button_control_wins_and_indicator_drop_is_loud():
@@ -59,6 +64,34 @@ def test_choice_button_control_wins_and_indicator_drop_is_loud():
     assert qt_props["channel"] == "X:SET"
     assert "readbackChannel" not in qt_props
     assert any("indicatorPv readback dropped" in w for w in warnings)
+
+
+LOC_DECLARED = "loc://mode?type=int&init=0&enum_string=['Off', 'On']"
+
+
+@pytest.mark.parametrize("name", ["activeChoiceButtonClass", "activeMenuButtonClass", "activeSliderClass"])
+@pytest.mark.parametrize(
+    "control, indicator",
+    [
+        pytest.param("X:SET", "X:SET", id="same-pv"),
+        # EDM names a LOC variable by the text before "=" (loc_pv_factory.cc).
+        pytest.param(LOC_DECLARED, "loc://mode", id="loc-variable-by-name"),
+    ],
+)
+def test_readback_naming_the_control_pv_drops_nothing(name, control, indicator):
+    qt_props, warnings = {}, []
+    _apply_channel_attrs(_obj(name, {"controlPv": control, "indicatorPv": indicator}), qt_props, warnings)
+    assert qt_props == {"channel": control}
+    assert warnings == []
+
+
+def test_readback_declaring_the_control_variable_is_dropped_loudly():
+    """The declaration goes with the readback: the channel names the variable bare."""
+    qt_props, warnings = {}, []
+    obj = _obj("activeMenuButtonClass", {"controlPv": "loc://mode", "indicatorPv": LOC_DECLARED})
+    _apply_channel_attrs(obj, qt_props, warnings)
+    assert qt_props == {"channel": "loc://mode"}
+    assert warnings == ["EDM indicatorPv readback dropped (controlPv kept as the channel)"]
 
 
 def test_alarm_pv_never_becomes_the_channel():
@@ -136,7 +169,7 @@ def test_visibility_rule_appends_to_alarm_rules():
 def test_state_button_with_readback_carries_live_labels_without_warning():
     qt_props = {"readbackChannel": "X:STATE"}
     warnings = []
-    obj = _obj("activeButtonClass", {"onLabel": "Enabled", "offLabel": "Disabled"})
+    obj = _obj("activeButtonClass", {"onLabel": "Enabled", "offLabel": "Disabled", "labelType": "literal"})
     _fixup_state_button(obj, qt_props, warnings)
     assert qt_props["text"] == "Disabled"
     assert qt_props["buttonType"] == "toggle"
@@ -145,9 +178,82 @@ def test_state_button_with_readback_carries_live_labels_without_warning():
 
 def test_state_button_without_readback_still_warns_on_differing_labels():
     qt_props, warnings = {}, []
-    obj = _obj("activeButtonClass", {"onLabel": "Running", "offLabel": "Stopped"})
+    obj = _obj("activeButtonClass", {"onLabel": "Running", "offLabel": "Stopped", "labelType": "literal"})
     _fixup_state_button(obj, qt_props, warnings)
     assert any("resting" in w for w in warnings)
+
+
+def test_button_without_label_type_shows_the_control_pv_state():
+    # EDM writes labelType only for "literal": absent means pvState, and the
+    # onLabel/offLabel it still carries are never drawn (button.cc drawActive).
+    node = _object_to_source(
+        _obj("activeButtonClass", {"controlPv": "X:MODE", "onLabel": "Running", "offLabel": "Stopped"})
+    )
+    assert node.qt_props["labelType"] == "pvState"
+    assert node.qt_props["readbackChannel"] == "X:MODE"
+    assert not {"text", "onLabel", "offLabel"} & node.qt_props.keys()
+    assert node.warnings == []
+
+
+def test_literal_button_switches_labels_on_the_control_pv():
+    node = _object_to_source(
+        _obj(
+            "activeButtonClass",
+            {"controlPv": "X:MODE", "onLabel": "Running", "offLabel": "Stopped", "labelType": "literal"},
+        )
+    )
+    assert "labelType" not in node.qt_props
+    assert node.qt_props["readbackChannel"] == "X:MODE"
+    assert (node.qt_props["text"], node.qt_props["onLabel"], node.qt_props["offLabel"]) == (
+        "Stopped",
+        "Running",
+        "Stopped",
+    )
+    assert node.warnings == []
+
+
+def test_button_state_follows_the_indicator_pv_when_present():
+    for label_type in ({}, {"labelType": "literal"}):
+        node = _object_to_source(
+            _obj("activeButtonClass", {"controlPv": "X:MODE_SET", "indicatorPv": "X:MODE", **label_type})
+        )
+        assert node.qt_props["channel"] == "X:MODE_SET"
+        assert node.qt_props["readbackChannel"] == "X:MODE"
+
+
+def test_message_button_labels_stay_literal_without_readback():
+    # Message buttons switch onLabel/offLabel on the press, not on a PV (message_button.cc).
+    node = _object_to_source(
+        _obj("activeMessageButtonClass", {"controlPv": "X:CMD", "onLabel": "Running", "offLabel": "Stopped"})
+    )
+    assert not {"labelType", "readbackChannel"} & node.qt_props.keys()
+    assert node.qt_props["text"] == "Stopped"
+    assert any("resting" in w for w in node.warnings)
+
+
+def test_state_buttons_validate_against_the_schema(tmp_path):
+    def button(y, *lines):
+        body = "\n".join(lines)
+        return (
+            "object activeButtonClass\nbeginObjectProperties\nmajor 4\nminor 0\nrelease 0\n"
+            f"x 10\ny {y}\nw 80\nh 20\n{body}\nendObjectProperties\n"
+        )
+
+    edl = tmp_path / "buttons.edl"
+    edl.write_text(
+        "4 0 1\nbeginScreenProperties\nmajor 4\nminor 0\nrelease 1\nx 0\ny 0\nw 200\nh 100\nendScreenProperties\n"
+        + button(10, 'controlPv "X:MODE"', 'onLabel "On"', 'offLabel "Off"')
+        + button(40, 'controlPv "X:MODE"', 'onLabel "On"', 'offLabel "Off"', 'labelType "literal"'),
+        encoding="utf-8",
+    )
+    screen = edm_file_to_ir(edl)
+    pv_state, literal = screen.root.children
+    assert pv_state.props["labelType"] == "pvState"
+    assert pv_state.props["readbackPV"] == "X:MODE"
+    assert "label" not in pv_state.props
+    assert literal.props["readbackPV"] == "X:MODE"
+    assert literal.props["label"] == "Off"
+    assert validate_screen_json(to_wire_dict(screen)) == []
 
 
 # ── closed/filled polylines ──────────────────────────────────────────────────

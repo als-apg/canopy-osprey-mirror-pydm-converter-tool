@@ -15,7 +15,7 @@ from qtpy import uic
 
 from pydmconverter.edm.converter import convert
 from pydmconverter.edm.parser import EDMFileParser
-from pydmconverter.widgets import edm_to_ui_filename
+from pydmconverter.widgets import FILENAME_RULE_EXPRESSION, edm_to_ui_filename, filename_rule
 
 HEADER = """\
 4 0 1
@@ -79,9 +79,11 @@ def labeled_group(vis_pv, vis_min, vis_max, x=600, y=4, w=180, h=16):
 
 
 def message_button(control_pv, press_value):
+    # press_value=None leaves pressValue out, as EDM does for a button writing only on release.
+    press = "" if press_value is None else f'pressValue "{press_value}"\n'
     return (
         "object activeMessageButtonClass\nbeginObjectProperties\nmajor 4\nminor 0\nrelease 0\n"
-        f'x 404\ny 4\nw 124\nh 20\ncontrolPv "{control_pv}"\npressValue "{press_value}"\n'
+        f'x 404\ny 4\nw 124\nh 20\ncontrolPv "{control_pv}"\n{press}'
         'onLabel "li21"\nendObjectProperties\n'
     )
 
@@ -131,7 +133,7 @@ def own_macros(display):
 
 
 LASER = r"LOC\\laserDispPV=e:0,Drive Laser,Laser Heater,Infrastructure"
-LASER_FILES = ["lasr_gunb_main_drivelaser.edl", "lasr_gunb_main_heater.edl", "lasr_gunb_main_misc.edl"]
+LASER_FILES = ["laser_drive.edl", "laser_heater.edl", "laser_misc.edl"]
 
 
 def test_choice_button_on_menu_window_becomes_tabs(tmp_path):
@@ -155,9 +157,9 @@ def test_choice_button_on_menu_window_becomes_tabs(tmp_path):
     ]
     displays = [p.find("widget") for p in pages]
     assert [prop(d, "filename") for d in displays] == [
-        "lasr_gunb_main_drivelaser.ui",
-        "lasr_gunb_main_heater.ui",
-        "lasr_gunb_main_misc.ui",
+        "laser_drive.ui",
+        "laser_heater.ui",
+        "laser_misc.ui",
     ]
     # Each page holds the window at its own size, below a tab bar as tall as the button.
     assert {prop(d, "geometry") for d in displays} == {(0, 0, 1148, 508)}
@@ -172,14 +174,14 @@ def test_tab_pages_take_their_own_macros_and_extensionless_names(tmp_path):
         tmp_path,
         pip(
             r"LOC\\$(!W)chose=e:1,LongTerm,ShortTerm",
-            ["adsGraphEmb.edl", "adsGraphEmb"],
+            ["graph_embed.edl", "graph_embed"],
             symbols=["P=UND1,N=LTC", "P=UND1,N=STC"],
         ),
         choice(r"LOC\\$(!W)chose"),
     )
     (tabs,) = top_level(root)
     displays = [p.find("widget") for p in tabs.findall("widget")]
-    assert [prop(d, "filename") for d in displays] == ["adsGraphEmb.ui", "adsGraphEmb.ui"]
+    assert [prop(d, "filename") for d in displays] == ["graph_embed.ui", "graph_embed.ui"]
     assert [own_macros(d) for d in displays] == [
         {"P": "UND1", "N": "LTC"},
         {"P": "UND1", "N": "STC"},
@@ -205,9 +207,9 @@ def test_variable_shared_with_another_widget_switches_stacked_displays(tmp_path)
     ]
     displays, enum_button, message = widgets[:3], widgets[3], widgets[4]
     assert [prop(d, "filename") for d in displays] == [
-        "lasr_gunb_main_drivelaser.ui",
-        "lasr_gunb_main_heater.ui",
-        "lasr_gunb_main_misc.ui",
+        "laser_drive.ui",
+        "laser_heater.ui",
+        "laser_misc.ui",
     ]
     assert {prop(d, "geometry") for d in displays} == {(4, 24, 1148, 508)}
     for index, display in enumerate(displays):
@@ -239,21 +241,21 @@ def test_menu_window_without_choice_button_shows_its_starting_entry(tmp_path, qt
         tmp_path,
         pip(
             r"LOC\\myLocalPV=e:1",
-            ["GigE_controls", "GigE_other.edl"],
+            ["camera_controls", "camera_other.edl"],
             symbols=["P=PROF:,ID=1020", "P=PROF:,ID=1800"],
         ),
     )
     (display,) = top_level(root)
-    assert prop(display, "filename") == "GigE_other.ui"
+    assert prop(display, "filename") == "camera_other.ui"
     assert own_macros(display) == {"P": "PROF:", "ID": "1800"}
     assert loaded_macros(tmp_path, qtbot) == {"P": "PROF:", "ID": "1800"}
 
 
 def test_menu_window_shows_its_entry_over_its_file(tmp_path):
-    source = pip(r"LOC\\myLocalPV=e:1", ["GigE_controls", "GigE_other.edl"])
+    source = pip(r"LOC\\myLocalPV=e:1", ["camera_controls", "camera_other.edl"])
     root = convert_objects(tmp_path, source.replace('displaySource "menu"\n', 'displaySource "menu"\nfile "unused"\n'))
     (display,) = top_level(root)
-    assert prop(display, "filename") == "GigE_other.ui"
+    assert prop(display, "filename") == "camera_other.ui"
 
 
 @pytest.mark.parametrize("file_pv_line", [r'filePv "LOC\\sel=i:0"' "\n", ""])
@@ -272,63 +274,185 @@ def test_menu_window_without_entries_ignores_its_file(tmp_path, file_pv_line):
 def test_file_window_opens_its_file_not_a_menu_entry(tmp_path):
     # EDM (pip.cc) opens a file window's file attribute (macros expanded from the
     # parent); displayFileName and symbols belong to menu entries, which a window
-    # switched from "menu" to "file" keeps but ignores (misc/opsKlys_disp_li24.edl).
-    source = pip(
-        r"$(sector)", ["opsKlys_sector_li20", "opsKlys_sector_noepics"], symbols=["sector=LI20", "sector=LI21"]
-    )
+    # switched from "menu" to "file" keeps but ignores.
+    source = pip(r"$(sector)", ["sector_a", "sector_b"], symbols=["sector=LI20", "sector=LI21"])
     root = convert_objects(
-        tmp_path, source.replace('displaySource "menu"\n', 'displaySource "file"\nfile "opsKlys_sector_$(sector)"\n')
+        tmp_path, source.replace('displaySource "menu"\n', 'displaySource "file"\nfile "sector_$(sector)"\n')
     )
     (display,) = top_level(root)
-    assert prop(display, "filename") == "opsKlys_sector_${sector}.ui"
+    assert prop(display, "filename") == "sector_${sector}.ui"
     assert own_macros(display) == {}
+    # It never reads the filePv it keeps either, so no rule follows it.
+    assert filename_rules(display) == []
 
 
 @pytest.mark.parametrize("symbols", [["sector=LI20"], ["sector=LI20", "sector=LI21"]])
 def test_file_window_ignores_symbols(tmp_path, qtbot, symbols):
     # EDM (pip.cc) opens a file window with the parent's macros only: symbols belong
     # to a menu window's entries, so a window switched to "file" ignores them.
-    source = pip(r"$(sector)", ["sector_li20", "sector_li21"][: len(symbols)], symbols=symbols)
-    root = convert_objects(tmp_path, source.replace('displaySource "menu"', 'displaySource "file"\nfile "sector_li20"'))
+    source = pip(r"$(sector)", ["sector_a", "sector_b"][: len(symbols)], symbols=symbols)
+    root = convert_objects(tmp_path, source.replace('displaySource "menu"', 'displaySource "file"\nfile "sector_a"'))
     (display,) = top_level(root)
-    assert prop(display, "filename") == "sector_li20.ui"
+    assert prop(display, "filename") == "sector_a.ui"
     assert own_macros(display) == {}
     assert loaded_macros(tmp_path, qtbot) == {}
 
 
 @pytest.mark.parametrize("file_line", ["", 'file ""\n'])
 def test_file_window_without_a_file_shows_nothing(tmp_path, file_line):
-    # EDM opens nothing when a file window's file is blank (fileExists = 0).
-    source = pip(r"$(sector)", ["RESwaveforms", "RESwaveforms"])
+    # EDM opens nothing when a file window's file is blank (fileExists = 0), and
+    # never falls back to its filePv's value.
+    source = pip(r"$(sector)", ["waveforms", "waveforms"])
     root = convert_objects(tmp_path, source.replace('displaySource "menu"\n', f'displaySource "file"\n{file_line}'))
     (display,) = top_level(root)
     assert display.get("class") == "PyDMEmbeddedDisplay"
     assert prop(display, "filename") is None
+    assert filename_rules(display) == []
+
+
+def string_pv_pip(file_pv, files=()):
+    """A window with no displaySource line, which EDM reads as "stringPV"."""
+    return pip(file_pv, list(files)).replace('displaySource "menu"\n', 'file "unused"\n')
+
+
+def filename_rules(display):
+    return [rule for rule in json.loads(prop(display, "rules")) if rule["property"] == "Filename"]
 
 
 def test_string_pv_window_opens_its_local_variable_value(tmp_path):
     # No displaySource line means "stringPV": the window opens the file its filePv
-    # names, which for a LOC string is its initial value (misc/tdsEmbd.edl).
-    source = pip(r"LOC\\showMe=s:tdsVert", [], symbols=[])
-    root = convert_objects(tmp_path, source.replace('displaySource "menu"\n', 'file "unused"\n'))
+    # names, which for a LOC string is its initial value, and
+    # follows the variable from there.
+    root = convert_objects(tmp_path, string_pv_pip(r"LOC\\showMe=s:summary"))
     (display,) = top_level(root)
-    assert prop(display, "filename") == "tdsVert.ui"
+    assert prop(display, "filename") == "summary.ui"
+    (rule,) = filename_rules(display)
+    assert rule["channels"] == [{"channel": "loc://showMe?type=str&init=summary", "trigger": True, "use_enum": True}]
+    assert rule["initial_value"] == ""
 
 
-def test_string_pv_window_on_a_channel_shows_nothing(tmp_path):
-    # The file name is the PV's value at runtime, which a .ui file cannot follow.
-    source = pip("CUDBMPR:MCC0:VIDEO1", ["GigE_controls"])
-    root = convert_objects(tmp_path, source.replace('displaySource "menu"\n', ""))
+def test_string_pv_window_on_a_channel_follows_it(tmp_path):
+    # The file name is the PV's value at runtime: no file to start with, and a
+    # Filename rule on the PV. The CUD PVs are enums, so the rule reads their
+    # state strings (EDM's get_string).
+    root = convert_objects(tmp_path, string_pv_pip("CUDBMPR:MCC0:VIDEO1", ["camera_controls"]))
     (display,) = top_level(root)
     assert prop(display, "filename") is None
+    (rule,) = json.loads(prop(display, "rules"))
+    assert rule == filename_rule("CUDBMPR:MCC0:VIDEO1")
+    assert rule["channels"] == [{"channel": "CUDBMPR:MCC0:VIDEO1", "trigger": True, "use_enum": True}]
+
+
+def test_string_pv_window_keeps_its_group_visibility(tmp_path):
+    # The window sits in a group shown only while the PV's
+    # severity is 0. Both rules go in the one rules property.
+    group = (
+        "object activeGroupClass\nbeginObjectProperties\nmajor 4\nminor 0\nrelease 0\n"
+        "x 4\ny 24\nw 1148\nh 508\nbeginGroup\n"
+        + string_pv_pip("$(P)$(R)CamModelScreen")
+        + 'endGroup\nvisPv "$(P)$(R)CamModelScreen.SEVR"\nvisMin "0"\nvisMax "1"\nendObjectProperties\n'
+    )
+    root = convert_objects(tmp_path, group)
+    (display,) = [w for w in root.iter("widget") if w.get("class") == "PyDMEmbeddedDisplay"]
+    visible, filename = json.loads(prop(display, "rules"))
+    assert visible["property"] == "Visible"
+    assert visible["channels"][0]["channel"] == "${P}${R}CamModelScreen.SEVR"
+    assert filename == filename_rule("${P}${R}CamModelScreen")
 
 
 def test_edm_to_ui_filename():
     assert edm_to_ui_filename("screen.edl") == "screen.ui"
     assert edm_to_ui_filename("screen") == "screen.ui"
     assert edm_to_ui_filename("screen.ui") == "screen.ui"
-    assert edm_to_ui_filename("GigE_v1.2") == "GigE_v1.2.ui"
+    assert edm_to_ui_filename("cam_v1.2") == "cam_v1.2.ui"
     assert edm_to_ui_filename("composite file calc.edl;P=$(P),N=1") == "composite file calc.ui"
+
+
+def evaluate_filename_rule(value):
+    """The rule's expression as PyDM's RulesDispatcher evaluates it."""
+    return eval(FILENAME_RULE_EXPRESSION, {"ch": [value]})
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["summary", "summary.edl", "summary.edl;P=1", "summary.ui", "cam_v1.2", "screen.edl.bak", "a b.edl;P=$(P),N=1"],
+)
+def test_filename_rule_maps_a_name_like_edm_to_ui_filename(value):
+    assert evaluate_filename_rule(value) == edm_to_ui_filename(value)
+    # Padding around the name (a fixed-width string PV) is dropped.
+    assert evaluate_filename_rule(f" {value}  ") == edm_to_ui_filename(value)
+
+
+@pytest.mark.parametrize("value", ["", "   ", 3, None, [116, 100]])
+def test_filename_rule_embeds_nothing_for_a_blank_or_non_string_value(value):
+    # An enum's index arrives before its strings; PyDM re-runs the rule once they do.
+    assert evaluate_filename_rule(value) == ""
+
+
+def stub_screen(path, label):
+    path.write_text(
+        '<ui version="4.0"><class>Form</class><widget class="QWidget" name="Form">'
+        f'<widget class="QLabel" name="{label}"/></widget></ui>'
+    )
+
+
+@pytest.mark.parametrize(
+    "file_pv, writes",
+    [
+        # Message buttons write file names to a LOC string.
+        (r"LOC\\tdsShow=s:summary", ["details", "summary.edl"]),
+        # An enum PV: its state string names the file.
+        (r"LOC\\cudShow=e:0,summary,details", ["1", "0"]),
+    ],
+)
+def test_string_pv_window_switches_files_in_pydm(tmp_path, qtbot, file_pv, writes):
+    from pydm.display import load_file
+    from pydm.widgets import PyDMPushButton
+    from qtpy.QtWidgets import QLabel
+
+    root = convert_objects(tmp_path, string_pv_pip(file_pv), *(message_button(file_pv, w) for w in writes))
+    assert [w.get("class") for w in top_level(root)] == ["PyDMEmbeddedDisplay", "PyDMPushButton", "PyDMPushButton"]
+    for name in ("summary", "details"):
+        stub_screen(tmp_path / f"{name}.ui", name)
+    screen = load_file(str(tmp_path / "screen.ui"), target=None)
+    qtbot.addWidget(screen)
+    screen.show()
+    (display,) = screen.findChildren(QtEmbeddedDisplay)
+    more, back = sorted(screen.findChildren(PyDMPushButton), key=lambda b: writes.index(b.pressValue))
+
+    def shows(name):
+        return display.embedded_widget is not None and display.embedded_widget.findChild(QLabel, name) is not None
+
+    qtbot.waitUntil(lambda: shows("summary") and more.value is not None, timeout=3000)
+    more.sendValue()
+    qtbot.waitUntil(lambda: shows("details"), timeout=3000)
+    assert display.filename == "details.ui"
+    back.sendValue()
+    qtbot.waitUntil(lambda: shows("summary"), timeout=3000)
+
+
+def test_string_pv_window_written_blank_embeds_nothing_in_pydm(tmp_path, qtbot):
+    # EDM ignores a blank value and keeps the open display (pip.cc); PyDM's
+    # Filename "" unloads it. A later name loads again.
+    from pydm.display import load_file
+    from pydm.widgets import PyDMPushButton
+
+    file_pv = r"LOC\\blankShow=s:summary"
+    convert_objects(tmp_path, string_pv_pip(file_pv), message_button(file_pv, "summary"))
+    stub_screen(tmp_path / "summary.ui", "summary")
+    screen = load_file(str(tmp_path / "screen.ui"), target=None)
+    qtbot.addWidget(screen)
+    screen.show()
+    (display,) = screen.findChildren(QtEmbeddedDisplay)
+    (button,) = screen.findChildren(PyDMPushButton)
+    qtbot.waitUntil(lambda: display.embedded_widget is not None and button.value is not None, timeout=3000)
+
+    button.send_value_signal[str].emit("")
+    qtbot.waitUntil(lambda: display.embedded_widget is None, timeout=3000)
+    assert display.filename == ""
+    button.sendValue()
+    qtbot.waitUntil(lambda: display.embedded_widget is not None, timeout=3000)
+    assert display.filename == "summary.ui"
 
 
 def test_group_using_the_variable_switches_stacked_displays(tmp_path):
@@ -362,6 +486,21 @@ def test_choice_button_without_orientation_still_reads_as_a_tab_bar(tmp_path):
     (tabs,) = top_level(root)
     assert tabs.get("class") == "QTabWidget"
     assert len(tabs.findall("widget")) == 3
+
+
+def test_choice_button_on_a_macro_named_variable_becomes_tabs(tmp_path):
+    # The button and the window name LOC\\$(!W1)show,
+    # a LOC variable once EDM expands the macro (it keeps the backslash).
+    root = convert_objects(
+        tmp_path,
+        pip(r"LOC\\$(!W1)show=e:0,3222,3314", ["bkh_3222.edl", "bkh_3314.edl"]),
+        choice(r"LOC\\$(!W1)show"),
+    )
+    (tabs,) = top_level(root)
+    assert tabs.get("class") == "QTabWidget"
+    pages = tabs.findall("widget")
+    assert [p.find("attribute[@name='title']/string").text for p in pages] == ["3222", "3314"]
+    assert [prop(p.find("widget"), "filename") for p in pages] == ["bkh_3222.ui", "bkh_3314.ui"]
 
 
 def test_unique_marker_resolved_on_the_stacked_path(tmp_path):
@@ -417,8 +556,7 @@ def test_choice_button_without_channel_stays_an_empty_tab_widget(tmp_path):
 
 
 def menu_mux(control_pv, initial_state=None, x=710, y=4, w=75, h=20):
-    """A menu mux whose screen writes the chosen item's index to control_pv,
-    laid out as in b34/profile_b34.edl."""
+    """A menu mux whose screen writes the chosen item's index to control_pv."""
     state = f'initialState "{initial_state}"\n' if initial_state is not None else ""
     return (
         "object menuMuxClass\nbeginObjectProperties\nmajor 4\nminor 1\nrelease 0\n"
@@ -457,11 +595,11 @@ def switched_displays(root):
     return displays
 
 
-CAMERA_FILES = ["Rectangle.edl", "CamImage.edl"]
+CAMERA_FILES = ["Rectangle.edl", "camera_image.edl"]
 
 
 def test_menu_mux_switches_displays_starting_at_its_initial_state(convert_with_menus):
-    # b34/profile_b34.edl: nothing configures LOC\Display, so the menu declares
+    # Nothing configures LOC\Display, so the menu declares
     # it when its screen runs, starting at initialState.
     root, (menu,) = convert_with_menus(
         pip(r"LOC\\Display", CAMERA_FILES, x=620, y=195, w=165, h=125),
@@ -471,7 +609,7 @@ def test_menu_mux_switches_displays_starting_at_its_initial_state(convert_with_m
     # The displays read the bare variable and start on the menu's item...
     assert switched_displays(root) == [
         ("Rectangle.ui", "loc://Display", False),
-        ("CamImage.ui", "loc://Display", True),
+        ("camera_image.ui", "loc://Display", True),
     ]
     # ...which the screen declares the same way.
     assert menu["controlPv"] == "loc://Display?type=int&init=1"
@@ -490,12 +628,12 @@ def test_menu_mux_never_becomes_tabs(convert_with_menus):
 @pytest.mark.parametrize(
     "file_pv, control_pv, initial_state, address, start",
     [
-        # The menu's configuration defines the variable (prof/GigE_control_screen.edl).
+        # The menu's configuration defines the variable.
         (r"LOC\\Display", r"LOC\\Display=i:0", "1", "loc://Display?type=int&init=0", 0),
-        # The window's comes first and reaches the menu (prof/XTCAV4Experiments.edl).
+        # The window's comes first and reaches the menu.
         (r"LOC\\Display=i:1", r"LOC\\Display=i:0", "1", "loc://Display?type=int&init=1", 1),
         (r"LOC\\Display=i:1", r"LOC\\Display", "0", "loc://Display?type=int&init=1", 1),
-        # With enum strings (prof/aravisGigE_cameras.edl).
+        # With enum strings.
         (
             r"LOC\\Display",
             r"LOC\\Display=e:1,OFF,ON",
@@ -503,9 +641,12 @@ def test_menu_mux_never_becomes_tabs(convert_with_menus):
             "loc://Display?type=int&init=1&enum_string=['OFF', 'ON']",
             1,
         ),
-        # Nothing configures it: the menu starts at initialState, or at 0 past its items.
+        # Nothing configures it: the menu starts at initialState, clamped to its items.
         (r"LOC\\Display", r"LOC\\Display", None, "loc://Display?type=int&init=0", 0),
-        (r"LOC\\Display", r"LOC\\Display", "5", "loc://Display?type=int&init=0", 0),
+        (r"LOC\\Display", r"LOC\\Display", "5", "loc://Display?type=int&init=1", 1),
+        (r"LOC\\Display", r"LOC\\Display", "-1", "loc://Display?type=int&init=0", 0),
+        # Read like atol, so a leading "+" counts.
+        (r"LOC\\Display", r"LOC\\Display", "+1", "loc://Display?type=int&init=1", 1),
         # A start from the screen's macros is known only when it runs, which declares it then.
         (r"LOC\\Display", r"LOC\\Display", "$(START)", "loc://Display", 0),
     ],
@@ -551,7 +692,7 @@ def test_menu_mux_on_another_variable_leaves_the_window_static(convert_with_menu
         pip(r"LOC\\Display=i:1", CAMERA_FILES), menu_mux(r"LOC\\DISP", initial_state="0")
     )
     (display,) = top_level(root)
-    assert prop(display, "filename") == "CamImage.ui"
+    assert prop(display, "filename") == "camera_image.ui"
     assert json.loads(prop(display, "rules") or "[]") == []
     assert menu["controlPv"] == "loc://DISP"
 
@@ -718,3 +859,263 @@ def test_one_based_block_shown_display(tmp_path, init, filename, macros):
     (display,) = top_level(convert_objects(tmp_path, pip(rf"LOC\\v=i:{init}", ONE_BASED, **ONE_BASED_BLOCKS)))
     assert prop(display, "filename") == filename
     assert own_macros(display) == macros
+
+
+# Menu windows that message buttons or a real PV switch.
+HOMS = r"LOC\\\\intPV:=0"
+HOMS_FILES = ["gantry.edl", "gantry.edl", "pitch.edl"]
+HOMS_SYMBOLS = ["M1=Y1,ORIENT=Vertical", "M1=X1,ORIENT=Horizontal", "P=PITCH"]
+
+
+def with_lines(edm_object, *lines):
+    """edm_object with property lines added at its end."""
+    return edm_object.replace("endObjectProperties\n", "".join(f"{line}\n" for line in lines) + "endObjectProperties\n")
+
+
+def menu_button(control_pv):
+    return (
+        "object activeMenuButtonClass\nbeginObjectProperties\nmajor 4\nminor 0\nrelease 0\n"
+        f'x 404\ny 4\nw 124\nh 20\ncontrolPv "{control_pv}"\nendObjectProperties\n'
+    )
+
+
+def test_message_buttons_writing_indices_switch_stacked_displays(tmp_path):
+    # Invisible message buttons over a drawing write the
+    # index of the display to show.
+    root = convert_objects(
+        tmp_path,
+        message_button(HOMS, "2"),
+        pip(HOMS, HOMS_FILES, symbols=HOMS_SYMBOLS),
+        message_button(HOMS, "0"),
+        message_button(HOMS, "1"),
+    )
+    widgets = top_level(root)
+    assert [w.get("class") for w in widgets] == ["PyDMPushButton"] + ["PyDMEmbeddedDisplay"] * 3 + [
+        "PyDMPushButton"
+    ] * 2
+    assert switched_displays(root) == [
+        ("gantry.ui", "loc://intPV:", True),
+        ("gantry.ui", "loc://intPV:", False),
+        ("pitch.ui", "loc://intPV:", False),
+    ]
+    assert [own_macros(d) for d in widgets[1:4]] == [
+        {"M1": "Y1", "ORIENT": "Vertical"},
+        {"M1": "X1", "ORIENT": "Horizontal"},
+        {"P": "PITCH"},
+    ]
+    assert {prop(b, "channel") for b in widgets[:1] + widgets[4:]} == {"loc://intPV:?type=int&init=0"}
+
+
+def test_bare_message_button_gets_the_variable_definition(tmp_path):
+    root = convert_objects(tmp_path, pip(r"LOC\\sel=i:1", ["a.edl", "b.edl"]), message_button(r"LOC\\sel", "0"))
+    assert switched_displays(root) == [("a.ui", "loc://sel", False), ("b.ui", "loc://sel", True)]
+    # The button may connect first; PyDM's local plugin takes the variable's
+    # type and initial value from the first channel.
+    assert prop(top_level(root)[-1], "channel") == "loc://sel?type=int&init=1"
+
+
+def test_message_button_writing_a_macro_switches_stacked_displays(tmp_path):
+    root = convert_objects(tmp_path, pip(r"LOC\\sel=i:0", ["a.edl", "b.edl"]), message_button(r"LOC\\sel", "$(TAB)"))
+    assert [d[0] for d in switched_displays(root)] == ["a.ui", "b.ui"]
+
+
+def test_message_button_window_starting_at_minus_one_opens_on_entry_zero(tmp_path):
+    # A window whose variable starts at -1 writes 0 on its first value rather
+    # than popping its menu up (pip.cc), so the variable starts at 0.
+    root = convert_objects(tmp_path, pip(r"LOC\\ebwM=i:-1", ["a.edl", "b.edl"]), message_button(r"LOC\\ebwM", "1"))
+    assert switched_displays(root) == [("a.ui", "loc://ebwM", True), ("b.ui", "loc://ebwM", False)]
+    assert prop(top_level(root)[-1], "channel") == "loc://ebwM?type=int&init=0"
+
+
+VIEW = r"LOC\\view=e:1,Beam,Laser"
+
+
+def test_menu_button_on_the_variable_switches_stacked_displays(tmp_path):
+    # The menu button's combo box writes the index of the state chosen.
+    root = convert_objects(tmp_path, pip(VIEW, ["a.edl", "b.edl"]), menu_button(r"LOC\\view"))
+    assert switched_displays(root) == [("a.ui", "loc://view", False), ("b.ui", "loc://view", True)]
+    # The combo box may connect first; PyDM's local plugin takes the variable's
+    # enum strings from the first channel.
+    (menu,) = [w for w in top_level(root) if w.get("class") == "PyDMEnumComboBox"]
+    assert prop(menu, "channel") == "loc://view?type=int&init=1&enum_string=['Beam', 'Laser']"
+
+
+SEL = r"LOC\\sel=i:0"
+
+
+@pytest.mark.parametrize(
+    "objects",
+    [
+        # A button writing no display index.
+        pytest.param([pip(SEL, ["a.edl", "b.edl"]), message_button(SEL, "7")], id="not-an-index"),
+        # The converted button would not ask for the password.
+        pytest.param(
+            [pip(SEL, ["a.edl", "b.edl"]), with_lines(message_button(SEL, "1"), 'password "secret"')], id="password"
+        ),
+        pytest.param(
+            [
+                pip(SEL, ["a.edl", "b.edl"]),
+                message_button(SEL, "1"),
+                with_lines(message_button(SEL, "0"), 'releaseValue "-1"'),
+            ],
+            id="writes-minus-one",
+        ),
+        # A "menu" button writes -1 on release, which pops the
+        # window's menu up in EDM; the stacked displays would all hide.
+        pytest.param(
+            [
+                pip(r"LOC\\ebwM=i:-1", ["a.edl", "b.edl"]),
+                message_button(r"LOC\\ebwM", "1"),
+                with_lines(message_button(r"LOC\\ebwM", None), 'releaseValue "-1"'),
+            ],
+            id="release-writes-minus-one",
+        ),
+        # A menu button only showing the variable never writes it.
+        pytest.param(
+            [pip(SEL, ["a.edl", "b.edl"]), with_lines(menu_button(r"LOC\\other=i:0"), f'indicatorPv "{SEL}"')],
+            id="menu-button-showing-it",
+        ),
+        # Nothing in the file writes its macro-named LOC variable.
+        pytest.param([pip(r"LOC\\$(SIG)_View=0", ["a.edl", "b.edl"])], id="macro-named-loc-nothing-writes"),
+        # A named calculation missing from calc.list stays untranslated.
+        pytest.param([pip(r"CALC\\sum(X, Y)", ["a.edl", "b.edl"])], id="untranslated-calc"),
+        pytest.param([pip("", ["a.edl", "b.edl"])], id="blank-file-pv"),
+        pytest.param([pip("#GDET:FEE1:1:CONFIG", ["a.edl", "b.edl"])], id="comment-file-pv"),
+    ],
+)
+def test_menu_window_nothing_switches_shows_one_display(tmp_path, objects):
+    root = convert_objects(tmp_path, *objects)
+    displays = [w for w in top_level(root) if w.get("class") == "PyDMEmbeddedDisplay"]
+    assert [prop(d, "filename") for d in displays] == ["a.ui"]
+    assert not any(rule["property"] == "Visible" for rule in json.loads(prop(displays[0], "rules") or "[]"))
+
+
+def test_site_skipping_message_buttons_leaves_their_window_alone(tmp_path):
+    from pydmconverter.edm.converter_helpers import pair_menu_pips
+
+    source = tmp_path / "screen.edl"
+    source.write_text(HEADER + pip(SEL, ["a.edl", "b.edl"]) + message_button(r"LOC\\sel", "1"))
+    parser = EDMFileParser(str(source), str(tmp_path / "screen.ui"))
+
+    pair_menu_pips(parser.ui, {}, skip_widgets={"activemessagebuttonclass"})
+
+    assert [obj.name.lower() for obj in parser.ui.objects] == ["activepipclass", "activemessagebuttonclass"]
+    assert parser.ui.objects[1].properties["controlPv"] == "loc://sel"
+
+
+def test_site_skipping_menu_buttons_leaves_their_window_alone(tmp_path):
+    from pydmconverter.edm.converter_helpers import pair_menu_pips
+
+    source = tmp_path / "screen.edl"
+    source.write_text(HEADER + pip(VIEW, ["a.edl", "b.edl"]) + menu_button(r"LOC\\view"))
+    parser = EDMFileParser(str(source), str(tmp_path / "screen.ui"))
+
+    pair_menu_pips(parser.ui, {}, skip_widgets={"activemenubuttonclass"})
+
+    assert [obj.name.lower() for obj in parser.ui.objects] == ["activepipclass", "activemenubuttonclass"]
+    assert parser.ui.objects[1].properties["controlPv"] == "loc://view"
+
+
+@pytest.mark.parametrize(
+    "file_pv, channel",
+    [
+        # A PV name
+        ("GDET:FEE1:241:CONFIG", "GDET:FEE1:241:CONFIG"),
+        # A PV name with a macro
+        ("$(P):CH_DISP01", "${P}:CH_DISP01"),
+    ],
+)
+def test_menu_window_on_a_pv_switches_stacked_displays(tmp_path, file_pv, channel):
+    root = convert_objects(
+        tmp_path, pip(file_pv, ["detector_a.edl", "detector_b.edl"], symbols=["N=1", "N=2"]), choice(file_pv)
+    )
+    widgets = top_level(root)
+    # A choice button on the PV stays one: only a LOC variable's pair becomes tabs.
+    assert [w.get("class") for w in widgets] == ["PyDMEmbeddedDisplay", "PyDMEmbeddedDisplay", "PyDMEnumButton"]
+    # EDM opens nothing until the PV's first value, so no display starts visible.
+    assert switched_displays(root) == [("detector_a.ui", channel, False), ("detector_b.ui", channel, False)]
+    assert [own_macros(d) for d in widgets[:2]] == [{"N": "1"}, {"N": "2"}]
+    assert prop(widgets[2], "channel") == channel
+
+
+def load_switched_screen(tmp_path, qtbot, macros=None):
+    """Load tmp_path/screen.ui in PyDM; return its embedded displays and its
+    message buttons by press value."""
+    from pydm.display import load_file
+    from pydm.widgets import PyDMPushButton
+
+    screen = load_file(str(tmp_path / "screen.ui"), macros=macros, target=None)
+    qtbot.addWidget(screen)
+    screen.show()
+    buttons = {button.pressValue: button for button in screen.findChildren(PyDMPushButton)}
+    qtbot.waitUntil(lambda: all(button.value is not None for button in buttons.values()), timeout=3000)
+    return screen.findChildren(QtEmbeddedDisplay), buttons
+
+
+def visible_indices(displays):
+    return [index for index, display in enumerate(displays) if display.isVisible()]
+
+
+def test_message_buttons_switch_displays_in_pydm(tmp_path, qtbot):
+    homs = r"LOC\\homsPV=i:0"
+    convert_objects(
+        tmp_path,
+        message_button(homs, "2"),
+        pip(homs, ["gantry.edl", "gantry.edl", "pitch.edl"], symbols=["ORIENT=V", "ORIENT=H", "P=PITCH"]),
+        message_button(homs, "0"),
+        message_button(homs, "1"),
+    )
+    for name in ("gantry", "pitch"):
+        (tmp_path / f"{name}.ui").write_text(
+            '<ui version="4.0"><class>Form</class><widget class="QWidget" name="Form"/></ui>'
+        )
+    displays, buttons = load_switched_screen(tmp_path, qtbot)
+    assert [d.filename for d in displays] == ["gantry.ui", "gantry.ui", "pitch.ui"]
+
+    qtbot.waitUntil(lambda: visible_indices(displays) == [0], timeout=3000)
+    for press in ("2", "1", "0"):
+        buttons[press].sendValue()
+        qtbot.waitUntil(lambda: visible_indices(displays) == [int(press)], timeout=3000)
+        # PyDM loads a hidden embedded display once it shows.
+        assert displays[int(press)].embedded_widget is not None
+    assert displays[1].embedded_widget.macros()["ORIENT"] == "H"
+
+
+def test_message_button_window_starts_on_a_macro_value_in_pydm(tmp_path, qtbot):
+    # The variable starts at $(SELTAB).
+    tab = r"LOC\\tabPV=i:$(SELTAB)"
+    convert_objects(tmp_path, pip(tab, ["a.edl", "b.edl", "c.edl"]), message_button(tab, "0"))
+    displays, buttons = load_switched_screen(tmp_path, qtbot, macros={"SELTAB": "2"})
+
+    qtbot.waitUntil(lambda: visible_indices(displays) == [2], timeout=3000)
+    buttons["0"].sendValue()
+    qtbot.waitUntil(lambda: visible_indices(displays) == [0], timeout=3000)
+
+
+def test_message_button_window_starting_at_minus_one_shows_entry_zero_in_pydm(tmp_path, qtbot):
+    # EDM writes 0 to a window's variable that starts at -1 (pip.cc): entry 0
+    # stays shown once the variable connects.
+    convert_objects(tmp_path, pip(r"LOC\\ebwM=i:-1", ["a.edl", "b.edl"]), message_button(r"LOC\\ebwM", "1"))
+    displays, buttons = load_switched_screen(tmp_path, qtbot)
+
+    assert buttons["1"].value == 0
+    qtbot.waitUntil(lambda: visible_indices(displays) == [0], timeout=3000)
+    buttons["1"].sendValue()
+    qtbot.waitUntil(lambda: visible_indices(displays) == [1], timeout=3000)
+
+
+def test_menu_button_switches_displays_in_pydm(tmp_path, qtbot):
+    from pydm.display import load_file
+    from pydm.widgets import PyDMEnumComboBox
+
+    convert_objects(tmp_path, pip(VIEW, ["a.edl", "b.edl"]), menu_button(r"LOC\\view"))
+    screen = load_file(str(tmp_path / "screen.ui"), target=None)
+    qtbot.addWidget(screen)
+    screen.show()
+    (menu,) = screen.findChildren(PyDMEnumComboBox)
+    displays = screen.findChildren(QtEmbeddedDisplay)
+
+    qtbot.waitUntil(lambda: menu.currentText() == "Laser" and visible_indices(displays) == [1], timeout=3000)
+    assert [menu.itemText(index) for index in range(menu.count())] == ["Beam", "Laser"]
+    menu.activated[int].emit(0)  # the user chooses "Beam"
+    qtbot.waitUntil(lambda: visible_indices(displays) == [0], timeout=3000)

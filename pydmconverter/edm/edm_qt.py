@@ -7,10 +7,14 @@ value coercion lives in ``ir_adapter.py``.
 
 Reuses the EDM coverage knowledge from ``EDM_TO_PYDM_WIDGETS``/``EDM_TO_PYDM_ATTRIBUTES``
 but re-points the targets from PyDM dataclass attributes to Qt prop names.
+
+The PV roles per EDM class (``EDM_CHANNEL_ROLES``) live here too, and the .ui
+target reads them as well.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 # EDM class (lowercased) -> Qt class the registry knows; everything
@@ -27,7 +31,9 @@ EDM_TO_QT_CLASS: dict[str, str] = {
     "textentryclass": "PyDMLineEdit",
     "activebuttonclass": "PyDMPushButton",
     "activemessagebuttonclass": "PyDMPushButton",
-    "activemenubuttonclass": "PyDMPushButton",
+    # EDM's menu button shows its PV's state and pops up a list of the states to
+    # write (menu_button.cc): an enum combo box.
+    "activemenubuttonclass": "PyDMEnumComboBox",
     "activemotifsliderclass": "PyDMSlider",
     "activesliderclass": "PyDMSlider",
     "activetriumfsliderclass": "PyDMSlider",
@@ -63,25 +69,211 @@ EDM_TO_QT_CLASS: dict[str, str] = {
     # menuMuxClass deliberately absent: macro-muxing needs a design; stays unknown-widget.
 }
 
-# EDM attributes that name a data-PV channel, in PRIMARY-channel priority order.
-# When an object carries several (EDM buttons pair controlPv with indicatorPv),
-# controlPv wins: it is the write/primary channel; readPv/indicatorPv are
-# readbacks; the rest only ever appear alone. The adapter picks primary +
-# readback explicitly (ir_adapter._apply_channel_attrs) — funneling them all to
-# the single "channel" prop kept only the last attr parsed and re-pointed
-# widgets at the wrong PV.
-EDM_PRIMARY_CHANNEL_ORDER = ("controlPv", "readPv", "indicatorPv", "pv", "filePv", "nullPv", "ctrl1Pv")
-# Readback preference when a second data channel is present.
-EDM_READBACK_CHANNEL_ORDER = ("indicatorPv", "readPv")
-# alarmPv is deliberately NOT a data channel: it names the alarm-severity source
-# for alarm-color rules (ir_adapter._alarm_rules) and must never steal the
-# widget's channel (nor make a static label "live" — see has_pv).
-EDM_CHANNEL_ATTRS = EDM_PRIMARY_CHANNEL_ORDER + ("alarmPv",)
+
+@dataclass(frozen=True)
+class ChannelRoles:
+    """What each PV tag of an EDM class does, from EDM's C++ source.
+
+    EDM has no single "channel": each class gives each PV tag a fixed role, and
+    one tag means different things on different classes. An indicatorPv is the
+    value a bar shows but a button's readback; a nullPv is a colour condition on
+    a text control but an offset on a bar. Both targets read this table
+    (converter_helpers.apply_channel_roles, ir_adapter._apply_channel_attrs), so
+    neither keeps whichever tag the file happens to list last.
+
+    data: the PV the widget shows and writes, the first one present.
+    readback: the PV the widget shows its state from while writing the data PV
+        (the button family's indicatorPv). With no data PV it is the only PV the
+        widget shows, so it takes the data PV's place.
+    color: the PVs whose value picks a colors.list rule colour, the first one
+        present. They are never shown.
+    alarm: the PV whose alarm severity colours the widget. It is never shown.
+    null: the PV a text control compares under its nullCondition to draw its
+        text in nullColor. It is never shown.
+    """
+
+    data: tuple[str, ...] = ("controlPv",)
+    readback: str | None = None
+    color: tuple[str, ...] = ()
+    alarm: str | None = None
+    null: str | None = None
+
+    def data_attr(self, properties: dict[str, Any]) -> str | None:
+        """The tag of the object's data PV, or ``None`` for none."""
+        for attr in (*self.data, self.readback):
+            if attr and properties.get(attr):
+                return attr
+        return None
+
+    def readback_attr(self, properties: dict[str, Any]) -> str | None:
+        """The tag of the object's readback, when it has a data PV besides."""
+        if self.readback and properties.get(self.readback) and self.data_attr(properties) != self.readback:
+            return self.readback
+        return None
+
+    def color_attr(self, properties: dict[str, Any]) -> str | None:
+        """The tag of the PV that picks the object's rule colours, or ``None``."""
+        return next((attr for attr in self.color if properties.get(attr)), None)
+
+
+# Static text and drawings show no PV; their alarmPv's value also picks their
+# rule colours (x_text_obj.cc, rectangle_obj.cc and the other drawings).
+_STATIC_ROLES = ChannelRoles(data=(), color=("alarmPv",), alarm="alarmPv")
+# The button family writes its controlPv. Button labels and a menu's or choice
+# button's selection follow the indicatorPv when there is one (button.cc,
+# menu_button.cc, choice_button.cc).
+_BUTTON_ROLES = ChannelRoles(readback="indicatorPv", color=("colorPv",))
+# Bars and indicators have no controlPv; a bar's nullPv is an offset subtracted
+# from the value (bar.cc), not a colour condition.
+_BAR_ROLES = ChannelRoles(data=("indicatorPv",))
+# xTextDsp: colorPv picks the fg and bg rule colours, with no fallback to the
+# controlPv; nullPv switches the fg to nullColor (x_text_dsp_obj.cc).
+_TEXT_CONTROL_ROLES = ChannelRoles(color=("colorPv",), null="nullPv")
+# Textupdate's fg rule colour follows its colorPv, else its controlPv (textupdate.cc).
+_TEXTUPDATE_ROLES = ChannelRoles(color=("colorPv", "controlPv"))
+
+# EDM class (lowercased) -> its PV roles. A class not listed reads its controlPv
+# and nothing else.
+EDM_CHANNEL_ROLES: dict[str, ChannelRoles] = {
+    "activextextdspclass": _TEXT_CONTROL_ROLES,
+    "activextextdspclassnoedit": _TEXT_CONTROL_ROLES,
+    "textupdateclass": _TEXTUPDATE_ROLES,
+    "regtextupdateclass": _TEXTUPDATE_ROLES,
+    "textentryclass": ChannelRoles(color=("colorPv",)),
+    # The multi-line classes spell it colourPv.
+    "multilinetextupdateclass": ChannelRoles(color=("colourPv",)),
+    "multilinetextentryclass": ChannelRoles(color=("colourPv",)),
+    "activextextclass": _STATIC_ROLES,
+    "activexregtextclass": _STATIC_ROLES,
+    "activerectangleclass": _STATIC_ROLES,
+    "activecircleclass": _STATIC_ROLES,
+    "activearcclass": _STATIC_ROLES,
+    "activelineclass": _STATIC_ROLES,
+    "activebuttonclass": _BUTTON_ROLES,
+    "activemenubuttonclass": _BUTTON_ROLES,
+    "activechoicebuttonclass": _BUTTON_ROLES,
+    # The slider draws a second pointer and a readback value from its indicatorPv.
+    "activesliderclass": ChannelRoles(readback="indicatorPv"),
+    # A message button only writes its controlPv (message_button.cc never monitors it).
+    "activemessagebuttonclass": ChannelRoles(color=("colorPv",)),
+    "activeupdownbuttonclass": ChannelRoles(color=("colorPv",)),
+    "activerampbuttonclass": ChannelRoles(color=("colorPv",)),
+    "activebarclass": _BAR_ROLES,
+    "activeslacbarclass": _BAR_ROLES,
+    "activevsbarclass": _BAR_ROLES,
+    "activeindicatorclass": _BAR_ROLES,
+    "activemeterclass": ChannelRoles(data=("readPv",)),
+    # ctrl2Pv drives a second slider (converter_helpers.create_multi_sliders).
+    "mmvclass": ChannelRoles(data=("ctrl1Pv",)),
+    "activecoeftableclass": ChannelRoles(data=("pv",)),
+    # The filePv names the file shown, or picks a menu entry (pip.cc).
+    "activepipclass": ChannelRoles(data=("filePv",)),
+    # Its pv[] are written with literal value[] when a display opens.
+    "relateddisplayclass": ChannelRoles(data=(), color=("colorPv",)),
+    # Its pv's string value names the file the table reads (table.cc).
+    "activetableclass": ChannelRoles(data=("pv",)),
+}
+_DEFAULT_ROLES = ChannelRoles()
+
+# EDM class (lowercased) -> its alarm flags -> the PyDM property each one turns
+# on. alarmSensitiveContent colours the text, a push button's face or a
+# drawing's fill; alarmSensitiveBorder frames the widget, or recolours a
+# drawing's line (at its own width: Drawable.style_sheet). A flag not listed
+# never colours the .ui widget, and is dropped with a warning
+# (EDM_ALARM_FLAGS). The .ui target reads this table
+# (converter_helpers.apply_alarm_flags); the IR's alarm rules colour each part
+# themselves (ir_adapter._alarm_rules).
+_TEXT_ALARMS = {"fgAlarm": "alarmSensitiveContent"}
+# A Textupdate's lineAlarm draws its border in the alarm colour (textupdate.cc).
+_TEXTUPDATE_ALARMS = {**_TEXT_ALARMS, "lineAlarm": "alarmSensitiveBorder"}
+# EDM colours a button's label (fgAlarm) or face (bgAlarm: menu_button.cc,
+# choice_button.cc); PyDM colours the face for either.
+_BUTTON_ALARMS = {"fgAlarm": "alarmSensitiveContent", "bgAlarm": "alarmSensitiveContent"}
+_DRAWING_ALARMS = {"fillAlarm": "alarmSensitiveContent", "lineAlarm": "alarmSensitiveBorder"}
+EDM_ALARM_PROPS: dict[str, dict[str, str]] = {
+    "activextextclass": _TEXT_ALARMS,
+    "activexregtextclass": _TEXT_ALARMS,
+    "activextextdspclass": _TEXT_ALARMS,
+    "activextextdspclassnoedit": _TEXT_ALARMS,
+    "textupdateclass": _TEXTUPDATE_ALARMS,
+    "regtextupdateclass": _TEXTUPDATE_ALARMS,
+    "multilinetextupdateclass": _TEXT_ALARMS,
+    "textentryclass": _TEXT_ALARMS,
+    "multilinetextentryclass": _TEXT_ALARMS,
+    "activebuttonclass": _BUTTON_ALARMS,
+    "activemenubuttonclass": _BUTTON_ALARMS,
+    "activechoicebuttonclass": _BUTTON_ALARMS,
+    "activerectangleclass": _DRAWING_ALARMS,
+    "activecircleclass": _DRAWING_ALARMS,
+    "activearcclass": _DRAWING_ALARMS,
+    "activelineclass": _DRAWING_ALARMS,
+}
+# Text controls whose useAlarmBorder turns fgAlarm into an alarm-coloured
+# border around text in its static colour (x_text_dsp_obj.cc).
+EDM_ALARM_BORDER_CLASSES = frozenset({"activextextdspclass", "activextextdspclassnoedit"})
+# The alarm flags EDM objects carry: those above, a slider's controlAlarm and
+# indicatorAlarm (slider.cc), a bar's indicatorAlarm (bar.cc), a meter's
+# scaleAlarm and caseAlarm (meter.cc).
+EDM_ALARM_FLAGS = (
+    "fgAlarm",
+    "bgAlarm",
+    "lineAlarm",
+    "fillAlarm",
+    "controlAlarm",
+    "indicatorAlarm",
+    "scaleAlarm",
+    "caseAlarm",
+)
+
+# Tags that are a data PV on some class. An object carrying one its class does
+# not read (a related display's pv[]) drops it.
+EDM_DATA_PV_ATTRS = ("controlPv", "readPv", "indicatorPv", "pv", "filePv", "ctrl1Pv")
+
+# xyGraph PVs besides its traces' xPv/yPv, which neither target carries, and
+# what each does (xygraph.cc). nPv is one per trace.
+XY_GRAPH_UNMAPPED_PVS = {
+    "nPv": "how many points each trace plots",
+    "traceCtlPv": "a bitmask that hides traces",
+    "resetPv": "clears the plot",
+    "triggerPv": "when trigger-mode traces update",
+}
+
+
+def channel_roles(name_lower: str) -> ChannelRoles:
+    """The PV roles of an EDM class (lowercased name)."""
+    return EDM_CHANNEL_ROLES.get(name_lower, _DEFAULT_ROLES)
+
+
+# Classes whose ``value`` is the text they show. Elsewhere it is not a label: a
+# related display writes value[i] to pv[i] when it opens a display
+# (related_display.cc), and a stray value on a drawing or group shows nothing.
+EDM_TEXT_VALUE_CLASSES = frozenset({"activextextclass", "activexregtextclass"})
+
+
+def names_the_channel(readback: Any, channel: Any) -> bool:
+    """True when a readback names the channel's own PV and adds nothing to it,
+    so dropping it loses nothing.
+
+    EDM names a LOC variable by the text before "=" (loc_pv_factory.cc), so a
+    bare ``loc://x`` is the variable the channel ``loc://x?type=...`` declares.
+    A readback declaring the variable carries what the channel lacks.
+    """
+    if readback == channel:
+        return True
+    return (
+        isinstance(readback, str)
+        and isinstance(channel, str)
+        and readback.startswith("loc://")
+        and "?" not in readback
+        and channel.split("?", 1)[0] == readback
+    )
+
 
 # EDM attribute name -> Qt prop name (the key the registry's qtPropMap consumes).
 # Channel attrs are absent on purpose: the adapter routes them itself.
 EDM_TO_QT_PROP: dict[str, str] = {
-    # text / labels (the registry maps "text" -> text/label per widget)
+    # text / labels (the registry maps "text" -> text/label per widget);
+    # value only on EDM_TEXT_VALUE_CLASSES
     "value": "text",
     "label": "text",
     "buttonLabel": "text",
@@ -151,15 +343,15 @@ def has_pv(properties: dict[str, Any]) -> bool:
     label with an alarmPv stays a static label (previously it converted to a
     live pv-label bound to the alarm PV and displayed that PV's value).
     """
-    return any(attr in properties for attr in EDM_PRIMARY_CHANNEL_ORDER)
+    return any(attr in properties for attr in EDM_DATA_PV_ATTRS)
 
 
 def resolve_qt_class(name_lower: str, properties: dict[str, Any]) -> str | None:
     """Resolve an EDM class to a Qt class, or ``None`` (-> unknown-widget).
 
-    A static ``activeXTextClass`` (no PV) is a label with fixed text, so it maps to
-    ``QLabel`` (-> ``text-label``, which has a ``text`` prop). With a PV it is a live
-    value display, so it maps to ``PyDMLabel`` (-> ``pv-label``).
+    A static ``activeXTextClass`` (no data PV: its alarmPv is never shown, see
+    ``EDM_CHANNEL_ROLES``) is a label with fixed text, so it maps to ``QLabel``
+    (-> ``text-label``, which has a ``text`` prop).
 
     ``activeXTextDspClass`` is read-only unless its ``editable`` flag is set (EDM
     ``x_text_dsp_obj.cc`` loads it with a default of 0 and refuses input when it is
@@ -171,7 +363,7 @@ def resolve_qt_class(name_lower: str, properties: dict[str, Any]) -> str | None:
     polyline widget has no fill, so EDM's filled shapes (triangles, flow arrows)
     rendered as empty outlines.
     """
-    if name_lower == "activextextclass" and not has_pv(properties):
+    if name_lower == "activextextclass" and channel_roles(name_lower).data_attr(properties) is None:
         return "QLabel"
     if name_lower == "activextextdspclass" and not properties.get("editable"):
         return "PyDMLabel"

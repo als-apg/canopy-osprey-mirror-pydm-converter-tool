@@ -1,9 +1,13 @@
+import hashlib
+import math
 import os
 import re
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union, Any
+from urllib.parse import unquote
 from pydmconverter.custom_types import RGBA
+from pydmconverter.edm.window_macros import WINDOW_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,42 @@ def normalize_search_paths(search_paths: SearchPaths) -> List[str]:
     if isinstance(search_paths, (str, os.PathLike)):
         search_paths = [search_paths]
     return [path for path in map(os.fspath, search_paths) if path]
+
+
+def split_edm_path_list(value: str) -> List[str]:
+    """
+    Split an EDM path list such as ``EDMDATAFILES`` into its directories.
+
+    EDM separates directories with ``:``, as in ``/opt/edm/display:/opt/edm/shared``.
+    ``;`` separates them too, and a Windows drive (a single letter before ``:\\`` or ``:/``,
+    as in ``C:\\edm``) stays one entry. Empty entries are dropped.
+
+    As in EDM, a leading ``=`` (its mark for the default directory) is not part of the
+    directory, and the ``:`` of an ``http://`` or ``https://`` entry does not split it.
+    Such a URL entry is left out: EDM reads it over the network, the converter reads
+    local files only.
+    """
+    directories: List[str] = []
+    for chunk in value.split(";"):
+        parts = chunk.split(":")
+        i = 0
+        while i < len(parts):
+            part = parts[i]
+            # app_pkg.cc: "= means use this a default"; the "=" is stripped and the
+            # directory is still searched.
+            if part.startswith("="):
+                part = part[1:]
+            # app_pkg.cc fixupHttpPart keeps these four spellings of a URL scheme whole.
+            if part in ("http", "HTTP", "https", "HTTPS") and i + 1 < len(parts) and parts[i + 1].startswith("//"):
+                i += 2
+                continue
+            if len(part) == 1 and part.isalpha() and i + 1 < len(parts) and parts[i + 1][:1] in ("\\", "/"):
+                part = f"{part}:{parts[i + 1]}"
+                i += 1
+            if part:
+                directories.append(part)
+            i += 1
+    return directories
 
 
 def resolve_inside(base: Union[str, "os.PathLike[str]"], name: str, allowed_roots: Sequence[Path]) -> Optional[Path]:
@@ -234,14 +274,10 @@ def parse_calc_pv(edm_pv: str) -> Tuple[str, List[str], bool]:
 
     expr_part, args_part = get_calc_groups(edm_pv)
     name_or_expr = clean_escape_characters(expr_part).strip()
-    arg_string = clean_escape_characters(args_part)
-
-    arg_list: List[str] = []
-    if arg_string:
-        arg_list = [arg.strip() for arg in arg_string.split(",")]
-        for i in range(len(arg_list)):
-            if arg_list[i].startswith("LOC\\"):
-                arg_list[i] = loc_conversion(arg_list[i])
+    arg_list = get_calc_arguments(clean_escape_characters(args_part))
+    for i in range(len(arg_list)):
+        if arg_list[i].startswith("LOC\\"):
+            arg_list[i] = loc_conversion(arg_list[i])
 
     is_inline_expr = False
     if name_or_expr.startswith("{") and name_or_expr.endswith("}"):
@@ -250,35 +286,66 @@ def parse_calc_pv(edm_pv: str) -> Tuple[str, List[str], bool]:
     return name_or_expr, arg_list, is_inline_expr
 
 
-def get_calc_groups(edm_pv: str) -> Tuple[str]:
+def get_calc_groups(edm_pv: str) -> Tuple[str, str]:
+    """
+    Split a CALC PV into its expression (a calc.list name or an inline ``{...}``
+    expression) and the text after the ``(`` that opens its arguments.
+
+    As in EDM's ``CALC_PV_Factory::create`` (calc_pv_factory.cc), the expression
+    ends at the first ``(`` outside braces; without one there are no arguments.
+    """
     prefix = "CALC\\"
     if not edm_pv.startswith(prefix):
         raise ValueError(f"Not a CALC PV: {edm_pv}")
 
     edm_pv = edm_pv[len(prefix) :]
-    if "(" not in edm_pv and ")" not in edm_pv:
-        return edm_pv, ""
+    braces = 0
+    for i, ch in enumerate(edm_pv):
+        if ch == "{":
+            braces += 1
+        elif ch == "}" and braces:
+            braces -= 1
+        elif ch == "(" and not braces:
+            return edm_pv[:i], edm_pv[i + 1 :]
+    return edm_pv, ""
 
-    depth = 0
-    end_idx = -1
-    for i in range(len(edm_pv) - 1, -1, -1):
-        if edm_pv[i] == ")":
-            depth += 1
-        elif edm_pv[i] == "(":
-            depth -= 1
-            if depth == 0:
-                end_idx = i
+
+# A number as EDM's legalFloat (calc_pv_factory.cc) reads it.
+_CALC_CONSTANT = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$")
+
+
+def get_calc_arguments(args: str) -> List[str]:
+    """
+    Split the text after a CALC PV's ``(`` into its arguments like EDM's
+    ``get_arg`` (calc_pv_factory.cc).
+
+    Runs of ``,``, spaces, tabs and ``)`` before an argument are skipped, so an
+    empty argument disappears and the ones after it move up (``(X,,Y)`` makes Y
+    argument B). An argument ends at a top-level ``,`` or at the first ``)`` it
+    did not open, so a stray ``)`` never becomes part of a PV name.
+    """
+    arguments = []
+    i = 0
+    while True:
+        while i < len(args) and args[i] in ", \t)":
+            i += 1
+        if i >= len(args):
+            return arguments
+        # Like get_arg, start looking for the end after the first character.
+        end = i + 1
+        depth = 0
+        while end < len(args):
+            if args[end] == "(":
+                depth += 1
+            elif args[end] == ")":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif args[end] == "," and depth == 0:
                 break
-
-    if end_idx == -1:
-        logger.info(
-            f"Fixing Invalid CALC PV format (unbalanced parens): {edm_pv}"
-        )  # TODO: Comeback to see if I should fix this in the EDM file too
-
-        edm_pv += ")"
-        end_idx = edm_pv.rfind("(")
-        # raise ValueError(f"Invalid CALC PV format (unbalanced parens): {edm_pv}")
-    return edm_pv[:end_idx], edm_pv[end_idx + 1 : -1]
+            end += 1
+        arguments.append(args[i:end].rstrip())
+        i = end
 
 
 def clean_escape_characters(expr: str) -> str:
@@ -387,8 +454,7 @@ def translate_calc_pv_to_pydm(
 
     if is_inline_expr:
         expression = name_or_expr
-        # identifier = "inline_expr"
-        identifier = f"calc_{hash(edm_pv)}"
+        identifier = "calc"
     else:
         calc_name = name_or_expr
         if calc_name == "sum2":  # convert sum2 to sum (sum2 is not in calc_dict)
@@ -414,18 +480,52 @@ def translate_calc_pv_to_pydm(
         if i < len(letters):
             var_map[letters[i]] = arg
 
+    # A numeric argument is a constant, not a PV (CALC_ProcessVariable,
+    # calc_pv_factory.cc). PyDM would wait for a channel named "ca://15" to
+    # connect and never evaluate, so the number goes into the expression.
+    for letter, arg_val in list(var_map.items()):
+        if _CALC_CONSTANT.match(arg_val):
+            del var_map[letter]
+            # strtod reads "08" as 8, but Python rejects a leading zero in an integer.
+            value = re.sub(r"^([+-]?)0+(?=\d)", r"\1", arg_val)
+            value = f"({value})" if value[0] in "+-" else value
+            expression = re.sub(rf"(?<!\$\{{)\b{letter}\b", value, expression)
+
     query_pairs = []
     for letter, arg_val in var_map.items():
-        if not any(arg_val.startswith(proto) for proto in ("ca://", "pva://", "channel://")):
+        if "://" not in arg_val:
             arg_val = f"{default_prefix}{arg_val}"
-        query_pairs.append(f"{letter}={arg_val}")
+        query_pairs.append(f"{letter}={qs_escape(arg_val, plus=False)}")
 
-    query_pairs.append(f"expr={expression}")
+    query_pairs.append(f"expr={qs_escape(expression, plus=False)}")
 
     query_str = "&".join(query_pairs)
-    pydm_calc_address = f"calc://{identifier}?{query_str}"
+    pydm_calc_address = f"calc://{_calc_identifier(identifier, query_str)}?{query_str}"
 
     return pydm_calc_address
+
+
+def _calc_identifier(base: str, query: str) -> str:
+    """
+    The netloc of a calc URL: ``<base>_<12 hex digits of sha1(query)>``, then
+    ``_${NAME}`` for each macro the query uses and ``__UNIQUE__`` when it uses
+    ``$(!W)``.
+
+    PyDM keys calc connections by the netloc alone, for the whole application
+    (calc_plugin.py ``CalculationPlugin.get_connection_id``), while EDM keys a
+    CALC PV by its whole text. So calcs with the same name but different inputs
+    would share one result, and so would two embedded copies of a screen whose
+    macros differ. The digest tells different queries apart and is the same on
+    every conversion. Macros are substituted only when PyDM loads the screen,
+    so the netloc names them too and expands with them; ``__UNIQUE__`` becomes
+    ``${EDM_W}`` like every other ``$(!W)`` (window_macros.py).
+    """
+    identifier = f"{base}_{hashlib.sha1(query.encode()).hexdigest()[:12]}"
+    for macro in dict.fromkeys(re.findall(r"\$\{[^}]*\}", query)):
+        identifier += f"_{macro}"
+    if WINDOW_MARKER in query:
+        identifier += WINDOW_MARKER
+    return identifier
 
 
 def reformat_calc_expression(exp):
@@ -441,7 +541,9 @@ def reformat_calc_expression(exp):
     - ``#`` not equal -> ``!=``
     - ``=`` equality -> ``==`` (leaving ``<=``, ``>=``, ``!=``, ``==`` untouched)
     - ``&&`` / ``||`` -> ``and`` / ``or``
-    - ``cond ? a : b`` ternary -> ``(a if cond else b)`` (handles nesting)
+    - ``!x`` logical not -> ``(not x)``
+    - ``cond ? a : b`` ternary -> ``(a if cond else b)`` (handles nesting, also
+      inside parentheses)
     """
     # Exponentiation: ^ -> **
     exp = exp.replace("^", "**")
@@ -454,6 +556,7 @@ def reformat_calc_expression(exp):
 
     # Logical operators
     exp = exp.replace("&&", " and ").replace("||", " or ")
+    exp = _convert_calc_not(exp)
 
     # C-style ternary -> Python conditional expression
     exp = _convert_calc_ternary(exp)
@@ -461,15 +564,73 @@ def reformat_calc_expression(exp):
     return exp
 
 
-def _convert_calc_ternary(exp: str) -> str:
-    """
-    Convert an EPICS C-style ternary ``cond ? a : b`` into the Python
-    conditional expression ``(a if cond else b)``.
+# The name, number or ${MACRO} an EPICS unary operator applies to.
+_CALC_OPERAND_TOKEN = re.compile(r"(?:\$\{[^}]*\}|[\w.])*")
 
-    Handles right-associative nesting (``a ? b : c ? d : e``) and ternaries
-    nested in the true branch (``a ? b ? c : d : e``) by balancing ``?`` and
-    ``:`` like brackets while ignoring anything inside parentheses.
+
+def _calc_operand_end(exp: str, start: int) -> int:
     """
+    Index just past the operand that starts at ``exp[start]``: further unary
+    operators, then a name or number, then an optional parenthesised group (a
+    function call's arguments, or the whole operand). EPICS skips spaces between
+    elements, so ``ABS (A)`` is a call too.
+    """
+    i = start
+    while i < len(exp) and (exp[i].isspace() or exp[i] in "!-+~"):
+        i += 1
+    token_end = _CALC_OPERAND_TOKEN.match(exp, i).end()
+    i = token_end
+    while i < len(exp) and exp[i].isspace():
+        i += 1
+    if i < len(exp) and exp[i] == "(":
+        depth = 0
+        for j in range(i, len(exp)):
+            if exp[j] == "(":
+                depth += 1
+            elif exp[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+        return len(exp)
+    return token_end
+
+
+def _convert_calc_not(exp: str) -> str:
+    """
+    Convert EPICS logical not ``!x`` (but not ``!=``) into ``(not x)``.
+
+    In EPICS calc a unary operator binds tighter than any binary one (postfix.c
+    gives ``!`` the highest priority), so ``!A&&B`` is ``(!A)&&B`` and ``!A=1`` is
+    ``(!A)=1``. Python's ``not`` binds looser than comparisons and arithmetic, so
+    it is wrapped in parentheses together with its operand.
+    """
+    match = re.search(r"!(?!=)", exp)
+    if match is None:
+        return exp
+    start = match.start()
+    end = _calc_operand_end(exp, start + 1)
+    operand = exp[start + 1 : end].strip()
+    if not operand:
+        return exp[: start + 1] + _convert_calc_not(exp[start + 1 :])
+    return f"{exp[:start]}(not {_convert_calc_not(operand)}){_convert_calc_not(exp[end:])}"
+
+
+def _convert_calc_ternary(exp: str, wrap: bool = True) -> str:
+    """
+    Convert EPICS C-style ternaries ``cond ? a : b`` into Python conditional
+    expressions ``(a if cond else b)``.
+
+    EPICS accepts a ternary wherever an operand can go, so the ternaries inside
+    parentheses are converted first, one function argument at a time:
+    ``A=1?3:(A=2?5:0)`` becomes ``(3 if A==1 else (5 if A==2 else 0))`` and
+    ``MAX(A?1:2,B)`` becomes ``MAX(1 if A else 2,B)``. Then the top-level one:
+    right-associative nesting (``a ? b : c ? d : e``) and ternaries nested in
+    the true branch (``a ? b ? c : d : e``) are handled by balancing ``?`` and
+    ``:`` like brackets. ``wrap=False`` leaves out the outer parentheses, for a
+    ternary that already fills a parenthesised group or argument.
+    """
+    exp = _convert_calc_ternary_in_groups(exp)
+
     depth = 0
     q_index = -1
     for i, ch in enumerate(exp):
@@ -505,14 +666,77 @@ def _convert_calc_ternary(exp: str) -> str:
         # Unbalanced ternary; leave the expression untouched.
         return exp
 
-    cond = exp[:q_index].strip()
-    true_part = exp[q_index + 1 : colon_index].strip()
-    false_part = exp[colon_index + 1 :].strip()
+    cond = _convert_calc_ternary(exp[:q_index].strip())
+    true_part = _convert_calc_ternary(exp[q_index + 1 : colon_index].strip())
+    false_part = _convert_calc_ternary(exp[colon_index + 1 :].strip())
 
-    return (
-        f"({_convert_calc_ternary(true_part)} if {_convert_calc_ternary(cond)} "
-        f"else {_convert_calc_ternary(false_part)})"
-    )
+    converted = f"{true_part} if {cond} else {false_part}"
+    return f"({converted})" if wrap else converted
+
+
+def _convert_calc_ternary_in_groups(exp: str) -> str:
+    """Convert the ternaries inside each top-level parenthesised group of
+    ``exp``, splitting the group on its top-level commas (function arguments)."""
+    pieces = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(exp):
+        if ch == "(":
+            if depth == 0:
+                pieces.append(exp[start : i + 1])
+                start = i + 1
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                pieces.append(_convert_calc_ternary_arguments(exp[start:i]))
+                start = i
+    pieces.append(exp[start:])
+    return "".join(pieces)
+
+
+def _convert_calc_ternary_arguments(group: str) -> str:
+    """Convert a ternary in each top-level comma-separated part of ``group``."""
+    arguments = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(group):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            arguments.append(group[start:i])
+            start = i + 1
+    arguments.append(group[start:])
+    return ",".join(_convert_calc_ternary(argument, wrap=False) for argument in arguments)
+
+
+def qs_escape(text: str, plus: bool = True) -> str:
+    """
+    Escape a value for the query of a loc:// or calc:// address.
+
+    PyDM reads these queries with parse_qs (local_plugin.py and calc_plugin.py
+    UrlToPython), which ends a value at "&", decodes "%XX" and turns "+" into a
+    space. Only those characters are escaped: anything else, macros like
+    ${EDM_W} included, stays as written, since PyDM substitutes macros in the
+    address before it parses it. The calc plugin protects "+" itself
+    (parse_qs(query.replace("+", "%2B"))), so its values pass plus=False.
+
+    Parameters
+    ----------
+    text : str
+        The value as the variable or calc should see it.
+    plus : bool, optional
+        Whether to escape "+" too (the local plugin's queries).
+
+    Returns
+    -------
+    str
+        The value with "%", "&" and, with plus, "+" percent-encoded.
+    """
+    text = text.replace("%", "%25").replace("&", "%26")
+    return text.replace("+", "%2B") if plus else text
 
 
 def loc_conversion(edm_string: str) -> str:
@@ -529,6 +753,12 @@ def loc_conversion(edm_string: str) -> str:
 
     A value with no recognized type prefix (e.g. "CMOS:LI20:3490") becomes a
     str PV holding the whole text, whereas EDM drops its first two characters.
+
+    Other attributes without a ":" are read as EDM's setAttributes
+    (loc_pv_factory.cc) reads them: the first character is the type and the
+    next one is skipped, so "LOC\\x=intPv=Show" is an int holding 0. A bare
+    number stays an int ("LOC\\x=0"); attributes starting with no type EDM
+    knows give a bare "loc://<name>" that declares nothing.
 
     Parameters
     ----------
@@ -563,30 +793,16 @@ def loc_conversion(edm_string: str) -> str:
         "e": "int",  # mapping enum to int
     }
 
-    edm_type_keywords = {"intpv": "i", "doublepv": "d", "stringpv": "s", "enumpv": "e"}
-
     try:
         name, type_and_value = content.split("=", 1)
         name = name.lstrip("\\")
-        type_and_value = type_and_value.lstrip("=")  # for edgecases with ==
+        # EDM reads the attributes up to the next "=" or "~", skipping repeated
+        # separators as in LOC\name==0 (strtok_r in loc_pv_factory.cc create).
+        type_and_value = re.split(r"[=~]", type_and_value.lstrip("=~"), maxsplit=1)[0]
     except ValueError:
         name = content.lstrip("\\")
         return f"loc://{name}"
         # raise ValueError("Invalid EDM format: Missing '=' separator")
-
-    # Handle EDM type keyword format: LOC\$(!W)intPv=<name> or LOC\$(!W)intPv=intPv=<name>
-    name_suffix = name.split(")")[-1] if ")" in name else name
-    if name_suffix.lower() in edm_type_keywords:
-        macro_prefix = name[: len(name) - len(name_suffix)] if ")" in name else ""
-        type_char = edm_type_keywords[name_suffix.lower()]
-        # Strip redundant type keyword prefix from value (e.g., intPv=ShowChannels -> ShowChannels)
-        if "=" in type_and_value:
-            prefix_part, actual_name = type_and_value.split("=", 1)
-            if prefix_part.lower() in edm_type_keywords:
-                type_and_value = actual_name
-        name = macro_prefix + type_and_value
-        pydm_type = type_mapping.get(type_char, "int")
-        return f"loc://{name}?type={pydm_type}&init=0"
 
     try:
         type_char, value = type_and_value.split(":", 1)
@@ -597,9 +813,6 @@ def loc_conversion(edm_string: str) -> str:
             ):  # ex. type_and_value=i,10
                 value = type_and_value[2:]
                 type_char = type_and_value[0]
-            elif type_and_value in type_mapping:  # value is one of the mapped characters
-                value = ""
-                type_char = type_and_value
             else:
                 int(type_and_value)  # testing if this is a proper int
                 value = type_and_value
@@ -622,13 +835,24 @@ def loc_conversion(edm_string: str) -> str:
                 value = type_and_value
                 type_char = "d"
             except ValueError:
-                # EDM falls back to a string PV with an empty value when the
-                # initialization is unparseable, so mirror that behavior here.
-                logger.warning(
-                    f"Unparseable local PV initialization '{type_and_value}' for '{name}', defaulting to an empty string"
-                )
-                value = ""
-                type_char = "s"
+                if type_and_value[:1] not in type_mapping:
+                    # No type EDM knows either, as in LOC\$(!W)intPv=ShowChannels.
+                    # EDM ignores the attributes of all but a variable's first
+                    # declaration, so name the variable without declaring it: an
+                    # empty string declared here could win over the real one.
+                    logger.warning(f"Unparseable local PV attributes '{type_and_value}' for '{name}', not declaring it")
+                    return f"loc://{name}"
+                # The first character is the type and the next one is skipped,
+                # as in EDM's setAttributes; an int, double or enum value is read
+                # with atol/atof, so LOC\name=intPv is an int holding 0.
+                # A lone type character reads the same way: LOC\name=d is a
+                # double holding 0, not a blank init PyDM never configures.
+                type_char, value = type_and_value[0], type_and_value[2:]
+                if type_char != "s":
+                    head, sep, states = value.partition(",") if type_char == "e" else (value, "", "")
+                    number_pattern = r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?" if type_char == "d" else r"\s*[+-]?\d+"
+                    number = re.match(number_pattern, head)
+                    value = (number.group().strip() if number else "0") + sep + states
 
     edm_type = type_char.lower()
     if edm_type.isdigit():
@@ -664,9 +888,10 @@ def loc_conversion(edm_string: str) -> str:
         value_arr: List[str] = value.split(",")
         init: str = value_arr[0]
         enum_string: List[str] = value_arr[1:]
-        pydm_string = f"loc://{name}?type={pydm_type}&init={init}&enum_string={enum_string}"
+        query = f"init={qs_escape(init)}&enum_string={qs_escape(str(enum_string))}"
+        pydm_string = f"loc://{name}?type={pydm_type}&{query}"
     else:
-        pydm_string = f"loc://{name}?type={pydm_type}&init={value}"
+        pydm_string = f"loc://{name}?type={pydm_type}&init={qs_escape(value)}"
 
     return pydm_string
 
@@ -676,7 +901,7 @@ def loc_str_init(url: str) -> str:
     if not url.startswith("loc://") or not re.search(r"[?&]type=str(&|$)", url):
         return ""
     match = re.search(r"[?&]init=([^&]*)", url)
-    return match.group(1) if match else ""
+    return unquote(match.group(1)) if match else ""
 
 
 def replace_calc_and_loc_in_edm_content(
@@ -1268,7 +1493,9 @@ def convert_color_property_to_qcolor(fillColor: str, color_data: Dict[str, Any])
     red, green, blue = rgb[:3]
     alpha = 255
 
-    max_val = color_data.get("max", 256)
+    # Without a colors.list (parse_colors_list gives max None), or one with no "max"
+    # line, components are 16-bit: EDM starts from maxColor = 0x10000 (color_pkg.cc).
+    max_val = color_data.get("max") or 0x10000
     rgbMax = max(rgb)
     if rgbMax > 256:
         # Scale from 0-65535 to 0-255
@@ -1360,3 +1587,75 @@ def parse_edm_macros(macro_string: str) -> dict:
             logger.warning(f"Invalid macro pair format: '{pair}' in macro string: '{macro_string}'")
 
     return macro_dict
+
+
+# The leading number C's strtod() accepts (what EDM's atof() reads): hex first,
+# since the decimal pattern would otherwise stop at the "0" of "0x...".
+_HEX_PREFIX_RE = re.compile(r"[+-]?0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)(?:[pP][+-]?\d+)?")
+_DEC_PREFIX_RE = re.compile(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
+_SPECIAL_PREFIX_RE = re.compile(r"[+-]?(?:inf(?:inity)?|nan)", re.IGNORECASE)
+
+
+def edm_atof(text: str) -> float:
+    """C ``atof()`` semantics: the longest numeric prefix (decimal, hex, inf/nan), else 0.0."""
+    text = text.lstrip()
+    hex_match = _HEX_PREFIX_RE.match(text)
+    if hex_match:
+        token = hex_match.group(0)
+        sign = -1.0 if token.startswith("-") else 1.0
+        return sign * float.fromhex(token.lstrip("+-"))
+    match = _DEC_PREFIX_RE.match(text) or _SPECIAL_PREFIX_RE.match(text)
+    return float(match.group(0)) if match else 0.0
+
+
+def vis_limit(attr: str, value: Any, warnings: list[str]) -> float | None:
+    """One EDM ``visMin``/``visMax`` string -> the number EDM compares against.
+
+    EDM stores both as strings and evaluates them with ``atof()`` after macro
+    substitution, so a missing or non-numeric value (a PV name, "MAJOR") counts
+    as 0 and a numeric prefix ("1`", "0x80") counts as that number. A value that
+    *starts* with a macro depends on the caller's substitution and cannot be
+    evaluated at convert time: ``None`` (the caller drops that visibility rule).
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        text = ""  # a bare "visMin" line (no value) parses as True
+    elif isinstance(value, (int, float)):
+        return float(value)
+    else:
+        text = str(value)
+    if text.lstrip().startswith(("${", "$(")):
+        warnings.append(
+            f"EDM {attr} '{text}' depends on a macro and cannot be evaluated at convert time; "
+            "visibility rule dropped (widget always shown)"
+        )
+        return None
+    number = edm_atof(text)
+    if not math.isfinite(number):
+        warnings.append(f"EDM {attr} '{text}' is not a finite number; visibility rule dropped (widget always shown)")
+        return None
+    try:
+        exact = float(text)
+    except ValueError:
+        exact = None
+    if exact != number:
+        shown = int(number) if number.is_integer() else number
+        warnings.append(f"EDM {attr} '{text}' is not a plain number; evaluated as {shown} (EDM atof semantics)")
+    return number
+
+
+def vis_range(properties: Dict[str, Any], warnings: List[str]) -> tuple[float, float] | None:
+    """An EDM object's ``(visMin, visMax)`` as the numbers EDM compares against (see
+    :func:`vis_limit`), or None when a limit cannot be evaluated at convert time:
+    the caller drops the visibility rule, and ``warnings`` says why.
+
+    EDM shows the object while ``visMin <= value < visMax``. A missing limit is 0,
+    so a visPv without limits never shows ([0, 0) holds no value), or always with
+    visInvert.
+    """
+    low = vis_limit("visMin", properties.get("visMin"), warnings)
+    high = vis_limit("visMax", properties.get("visMax"), warnings) if low is not None else None
+    if low is None or high is None:
+        return None
+    return low, high

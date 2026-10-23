@@ -42,6 +42,15 @@ def test_convert_to_ir_rejects_unknown_suffix(tmp_path):
         react.convert_to_ir(bogus)
 
 
+def test_convert_to_ir_accepts_a_file_named_just_edl(tmp_path):
+    """Path(".edl").suffix is "", so the type comes from the name: the file converts."""
+    source = tmp_path / ".edl"
+    source.write_bytes(EDM_FIXTURE.read_bytes())
+    ir = react.convert_to_ir(source)
+    assert ir.metadata.source.type == "edl-converter"
+    assert ir.root.children
+
+
 def test_convert_file_writes_screen_json(tmp_path):
     out = react.convert_file(EDM_FIXTURE, tmp_path / "vac", override=True)
     assert out.name == "vac.screen.json"
@@ -187,6 +196,17 @@ def test_convert_file_and_folder_pass_scheme(tmp_path):
     assert json.loads((tmp_path / "plain" / "a.screen.json").read_text(encoding="utf-8"))["schemaVersion"] == "1.0"
 
 
+def test_convert_folder_converts_a_file_named_just_edl(tmp_path):
+    """The walk matches names, not Path.suffix (""), so a ".edl" file is found and converted."""
+    src = tmp_path / "in"
+    (src / "nested").mkdir(parents=True)
+    (src / "nested" / ".edl").write_bytes(EDM_FIXTURE.read_bytes())
+
+    found, failed = react.convert_folder(src, tmp_path / "out", override=True)
+    assert (found, failed) == (1, [])
+    assert (tmp_path / "out" / "nested" / ".edl.screen.json").is_file()
+
+
 # --- convert_bytes keeps the upload's identity (filename / search_paths) -------
 
 EDM_FIXTURES = Path(__file__).parent / "edm" / "fixtures"
@@ -199,8 +219,8 @@ def test_convert_bytes_without_filename_keeps_screen_id():
 
 
 def test_convert_bytes_filename_sets_id_and_title():
-    edm = react.convert_bytes(EDM_FIXTURE.read_bytes(), kind="edl", filename="vac_gunb_main.edl")
-    assert (edm.id, edm.metadata.title) == ("vac_gunb_main", "vac_gunb_main")
+    edm = react.convert_bytes(EDM_FIXTURE.read_bytes(), kind="edl", filename="status_screen.edl")
+    assert (edm.id, edm.metadata.title) == ("status_screen", "status_screen")
     ui = react.convert_bytes(UI_FIXTURE.read_bytes(), kind="ui", filename="mc_overview.ui")
     assert ui.id == "mc_overview"
 
@@ -418,27 +438,27 @@ def test_confine_file_refs_resolves_subdir_symbol(symbol_tree):
 
 def test_confine_file_refs_reads_parent_reference_between_search_paths(symbol_tree):
     """``..`` may leave the search path it was joined to when it lands inside another
-    one (SLAC displays use ``../pps/...``): with [root/lcls, root], ``../pps/sym``
-    joined to root/lcls is root/pps/sym.edl."""
+    one (as ``../shared/...`` does): with [root/displays, root], ``../shared/sym``
+    joined to root/displays is root/shared/sym.edl."""
     root = symbol_tree / "root"
-    (root / "lcls").mkdir()
-    (root / "pps").mkdir()
-    (root / "pps" / "sym.edl").write_bytes(SYMBOL_FILE.read_bytes())
+    (root / "displays").mkdir()
+    (root / "shared").mkdir()
+    (root / "shared" / "sym.edl").write_bytes(SYMBOL_FILE.read_bytes())
 
-    node = _symbol_node("../pps/sym", search_paths=[root / "lcls", root], confine_file_refs=True)
+    node = _symbol_node("../shared/sym", search_paths=[root / "displays", root], confine_file_refs=True)
     assert len(_state_groups(node)) == 2
     assert not any("symbol file" in w for w in node.warnings)
     # Without root among the search paths the same name lands outside every root.
-    assert _rejected(_symbol_node("../pps/sym", search_paths=[root / "lcls"], confine_file_refs=True))
+    assert _rejected(_symbol_node("../shared/sym", search_paths=[root / "displays"], confine_file_refs=True))
 
 
 def test_confine_file_refs_missing_in_bounds_symbol_is_not_found(symbol_tree):
     """A name that resolves inside some root but is not there is "not found", even when
     it leaves the other roots; "outside" is only for names no root can hold."""
     root = symbol_tree / "root"
-    (root / "lcls").mkdir()
+    (root / "displays").mkdir()
     for name in ("../sub/no_such_file", "no_such_file"):
-        node = _symbol_node(name, search_paths=[root / "lcls", root], confine_file_refs=True)
+        node = _symbol_node(name, search_paths=[root / "displays", root], confine_file_refs=True)
         assert node.children == []
         assert any(f"symbol file '{name}.edl' not found" in w for w in node.warnings), name
         assert not any("outside the search paths" in w for w in node.warnings), name
@@ -467,6 +487,27 @@ def test_confine_file_refs_skips_edmdatafiles(symbol_tree, monkeypatch):
     monkeypatch.chdir(symbol_tree / "outside")
     assert len(_state_groups(_symbol_node("secret", confine_file_refs=False))) == 2
     assert _symbol_node("secret", confine_file_refs=True).children == []
+
+
+@pytest.mark.parametrize(
+    ("confine_file_refs", "searched"),
+    [
+        (True, "beside the display or on the search paths"),
+        (False, "beside the display, on the search paths or on EDMDATAFILES"),
+    ],
+    ids=["confined", "unconfined"],
+)
+def test_missing_symbol_warning_names_the_places_searched(
+    symbol_tree, monkeypatch, caplog, confine_file_refs, searched
+):
+    """A confined lookup never reads EDMDATAFILES, so its "not found" warning, in the
+    log and on the node, doesn't send users there."""
+    _isolate_symbol_lookup(monkeypatch, symbol_tree)
+    node = _symbol_node("no_such_file", search_paths=[symbol_tree / "root"], confine_file_refs=confine_file_refs)
+    assert node.children == []
+    assert f"EDM symbol file 'no_such_file.edl' not found {searched}; symbol not rendered" in node.warnings
+    logged = [r.getMessage() for r in caplog.records if "no_such_file.edl" in r.getMessage()]
+    assert logged == [f"Symbol file 'no_such_file.edl' not found {searched}"]
 
 
 def test_symbol_files_unconfined_when_asked(symbol_tree):
@@ -571,3 +612,32 @@ def test_symbol_cut_short_as_recursive_still_renders_at_top_level(tmp_path, conf
         assert len(_state_groups(node)) == 2
         assert not any("includes itself" in w for w in node.warnings)
         assert f"EDM symbol file 'loop.edl' {INCLUDES_ITSELF}" in _all_warnings(node)
+
+
+def test_symbol_found_on_an_absolute_edmdatafiles_list(symbol_tree, monkeypatch):
+    """EDMDATAFILES lists absolute directories joined with ":"; a symbol in the second one is found."""
+    (symbol_tree / "empty").mkdir()
+    monkeypatch.setenv("EDMDATAFILES", f"{symbol_tree / 'empty'}:{symbol_tree / 'outside'}")
+    node = _symbol_node("secret", confine_file_refs=False)
+    assert len(_state_groups(node)) == 2
+    assert not any("symbol file" in w for w in node.warnings)
+
+
+def test_symbol_found_on_an_edmdatafiles_default_entry(symbol_tree, monkeypatch):
+    """A leading "=" marks EDM's default directory; the directory after it is searched."""
+    monkeypatch.setenv("EDMDATAFILES", f"={symbol_tree / 'outside'}")
+    node = _symbol_node("secret", confine_file_refs=False)
+    assert len(_state_groups(node)) == 2
+    assert not any("symbol file" in w for w in node.warnings)
+
+
+def test_edmdatafiles_url_entry_is_not_split_into_local_directories(symbol_tree, monkeypatch):
+    """An http:// entry is not split on its "://", so "http" (here a dir in the CWD) is
+    not searched."""
+    (symbol_tree / "http").mkdir()
+    (symbol_tree / "http" / "secret.edl").write_bytes((symbol_tree / "outside" / "secret.edl").read_bytes())
+    monkeypatch.chdir(symbol_tree)
+    monkeypatch.setenv("EDMDATAFILES", "http://example.invalid/displays")
+    node = _symbol_node("secret", confine_file_refs=False)
+    assert _state_groups(node) == []
+    assert any("'secret.edl' not found" in w for w in node.warnings), node.warnings

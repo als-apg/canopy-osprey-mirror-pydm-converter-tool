@@ -1,4 +1,5 @@
 import os
+import re
 import pytest
 import tempfile
 import textwrap
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 from pydmconverter.edm.parser_helpers import (
     normalize_search_paths,
+    split_edm_path_list,
     resolve_inside,
     search_calc_list,
     parse_calc_list,
@@ -245,22 +247,22 @@ def test_translate_calc_pv_to_pydm():
 
     edm_pv_named = "CALC\\sum(pv1)"
     pydm_pv = translate_calc_pv_to_pydm(edm_pv_named, calc_dict, default_prefix="pva://")
-    assert "calc://sum?" in pydm_pv
+    assert re.match(r"calc://sum_[0-9a-f]{12}\?", pydm_pv)
     assert "A=pva://pv1" in pydm_pv
     assert "B=pva://pv1.SEVR" in pydm_pv
     assert "expr=A+B" in pydm_pv
 
     edm_pv_named_no_rewrite = "CALC\\sub(myPV1, myPV2)"
     pydm_pv_no_rewrite = translate_calc_pv_to_pydm(edm_pv_named_no_rewrite, calc_dict, default_prefix="pva://")
-    assert "calc://sub?" in pydm_pv_no_rewrite
+    assert re.match(r"calc://sub_[0-9a-f]{12}\?", pydm_pv_no_rewrite)
     assert "A=pva://myPV1" in pydm_pv_no_rewrite
     assert "B=pva://myPV2" in pydm_pv_no_rewrite
     assert "expr=A-B" in pydm_pv_no_rewrite
 
     edm_pv_inline = "CALC\\{A*B}(x, y)"
     pydm_inline = translate_calc_pv_to_pydm(edm_pv_inline, default_prefix="pva://")
-    # Inline expressions now use hash-based identifiers for uniqueness
-    assert "calc://calc_" in pydm_inline
+    # Inline expressions are named "calc", plus the digest of their query
+    assert re.match(r"calc://calc_[0-9a-f]{12}\?", pydm_inline)
     assert "A=pva://x" in pydm_inline
     assert "B=pva://y" in pydm_inline
     assert "expr=A*B" in pydm_inline
@@ -299,6 +301,54 @@ def test_reformat_calc_expression():
     assert reformat_calc_expression("A?B?1:2:3") == "((1 if B else 2) if A else 3)"
 
 
+@pytest.mark.parametrize(
+    "epics, python",
+    [
+        # Ternaries inside parentheses
+        ("A=1?3:(A=2?5:0)", "(3 if A==1 else (5 if A==2 else 0))"),
+        ("A=1?4:(A=2?3:(A=3?2:0))", "(4 if A==1 else (3 if A==2 else (2 if A==3 else 0)))"),
+        ("(A?1:2)+1", "(1 if A else 2)+1"),
+        # each function argument on its own
+        ("MAX(A?1:2,B)", "MAX(1 if A else 2,B)"),
+        ("MAX(B,A?1:2)", "MAX(B,1 if A else 2)"),
+        # ! binds tighter than any binary operator (postfix.c), not looser like Python's not
+        ("!A&&B", "(not A) and B"),
+        ("!A=1", "(not A)==1"),
+        ("!A|B", "(not A)|B"),
+        ("!(A=0)", "(not (A==0))"),
+        ("!MAX(A,B)+1", "(not MAX(A,B))+1"),
+        ("!!A", "(not (not A))"),
+        ("C?!(D&&E):!(A||B)", "((not (D and E)) if C else (not (A or B)))"),
+        ("!(A?1:0)", "(not (1 if A else 0))"),
+        # EPICS skips spaces between elements, also before a function's (
+        ("!ABS (A)+1", "(not ABS (A))+1"),
+        ("!A&&(B)", "(not A) and (B)"),
+        # != and # stay comparisons
+        ("A!=B", "A!=B"),
+        ("A#B", "A!=B"),
+    ],
+)
+def test_reformat_calc_expression_nested(epics, python):
+    """Ternaries inside parentheses and EPICS logical not become valid Python."""
+    converted = reformat_calc_expression(epics)
+    assert converted == python
+    compile(converted, "<calc>", "eval")
+
+
+@pytest.mark.parametrize(
+    "epics, python",
+    [
+        # PyDM substitutes the macro when the screen loads
+        ("!${X}&&A", "(not ${X}) and A"),
+        # a ! with no operand is left as it is
+        ("A!", "A!"),
+    ],
+)
+def test_reformat_calc_expression_not_operand(epics, python):
+    """Logical not of a macro, and a ! with nothing after it."""
+    assert reformat_calc_expression(epics) == python
+
+
 def test_loc_conversion():
     """
     Test loc_conversion from LOC to loc:// syntax with type mapping and init values.
@@ -324,16 +374,49 @@ def test_loc_conversion():
     result_no_equals = loc_conversion(edm_string_missing_equals)
     assert result_no_equals == "loc://noEquals", f"Expected 'loc://noEquals', got '{result_no_equals}'"
 
-    # When colon is missing but value is 'i', it should be treated as a type char without value
+    # A lone type character has no value, which EDM reads with atol: an int holding 0
     edm_string_missing_colon = "LOC\\noColon=i"
     result_no_colon = loc_conversion(edm_string_missing_colon)
-    assert "loc://noColon" in result_no_colon, f"Expected loc://noColon in result, got '{result_no_colon}'"
+    assert result_no_colon == "loc://noColon?type=int&init=0"
 
-    # An unparseable initialization falls back to a string PV with an empty
-    # value, matching EDM behavior
+    # EDM reads the attributes up to the next "=", takes "i" as the type, skips
+    # "n" and reads "tPv" with atol: an int holding 0
     edm_string_unparseable = "LOC\\myLocal=intPv=ShowChannels"
     result_unparseable = loc_conversion(edm_string_unparseable)
-    assert result_unparseable == "loc://myLocal?type=str&init="
+    assert result_unparseable == "loc://myLocal?type=int&init=0"
+
+
+@pytest.mark.parametrize(
+    "edm_string, expected",
+    [
+        # The EDM manual's examples (userManual/edm.sgml), whose names are not keywords
+        ("LOC\\intPv=i:55", "loc://intPv?type=int&init=55"),
+        ("LOC\\stringPv=s:this is a string", "loc://stringPv?type=str&init=this is a string"),
+        ("LOC\\enumPv=e:1,zero,one,two", "loc://enumPv?type=int&init=1&enum_string=['zero', 'one', 'two']"),
+        # One variable named in two forms: the first declares an int holding 0,
+        # the second names the variable without declaring it
+        ("LOC\\__UNIQUE__intPv=intPv=ShowChannels", "loc://__UNIQUE__intPv?type=int&init=0"),
+        ("LOC\\__UNIQUE__intPv=ShowChannels", "loc://__UNIQUE__intPv"),
+        # First character the type, the next one skipped, numbers read like atol/atof
+        ("LOC\\x=i_12abc", "loc://x?type=int&init=12"),
+        ("LOC\\x=d_2.5V", "loc://x?type=float&init=2.5"),
+        ("LOC\\x=dZ", "loc://x?type=float&init=0"),
+        ("LOC\\x=e_1,off,on", "loc://x?type=int&init=1&enum_string=['off', 'on']"),
+        ("LOC\\x=e_on,off,on", "loc://x?type=int&init=0&enum_string=['off', 'on']"),
+        ("LOC\\x=s_text", "loc://x?type=str&init=text"),
+        # A lone type character holds 0, or an empty string
+        ("LOC\\x=d", "loc://x?type=float&init=0"),
+        ("LOC\\x=e", "loc://x?type=int&init=0&enum_string=[]"),
+        ("LOC\\x=s", "loc://x?type=str&init="),
+        # A bare number stays an int; repeated separators are skipped
+        ("LOC\\x=0", "loc://x?type=int&init=0"),
+        ("LOC\\x==0", "loc://x?type=int&init=0"),
+        ("LOC\\x=~i:3", "loc://x?type=int&init=3"),
+        ("LOC\\x==", "loc://x"),
+    ],
+)
+def test_loc_conversion_reads_attributes_like_edm(edm_string, expected):
+    assert loc_conversion(edm_string) == expected
 
 
 def test_loc_conversion_untyped_value_with_colon():
@@ -481,7 +564,7 @@ def test_replace_calc_uses_explicit_calc_list(tmp_path):
         edm_content, filepath=str(fake_file), calc_list_file=str(calc_list_file)
     )
 
-    assert "calc://sum?A=ca://pv1&B=ca://pv2&expr=A+B" in new_content
+    assert re.search(r"calc://sum_[0-9a-f]{12}\?A=ca://pv1&B=ca://pv2&expr=A\+B", new_content)
     assert "CALC\\\\sum(pv1, pv2)" in encountered_calcs
 
 
@@ -706,3 +789,29 @@ def test_default_invalid(monkeypatch, clear_env):
 
     result = search_color_list()
     assert result is None, "Should return None if nothing else is found"
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        # EDM's own form: absolute directories joined with ":".
+        ("/opt/edm/display:/opt/edm/shared", ["/opt/edm/display", "/opt/edm/shared"]),
+        ("display:shared", ["display", "shared"]),
+        (".", ["."]),
+        ("", []),
+        ("::/a::", ["/a"]),
+        # A Windows drive stays one entry, with ";" or ":" between entries.
+        ("C:\\edm\\display;D:\\pps", ["C:\\edm\\display", "D:\\pps"]),
+        ("C:\\edm:D:\\pps", ["C:\\edm", "D:\\pps"]),
+        ("C:/edm:/usr/x", ["C:/edm", "/usr/x"]),
+        # A leading "=" marks EDM's default directory; the directory is still searched.
+        ("/usr/a:=/usr/b", ["/usr/a", "/usr/b"]),
+        ("=", []),
+        # A URL entry is not split on its "://" and, not being local, is left out.
+        ("http://host/edm:/usr/x", ["/usr/x"]),
+        ("/usr/x;https://host/edm:.", ["/usr/x", "."]),
+        ("HTTPS://host/edm:=HTTP://host/pps", []),
+    ],
+)
+def test_split_edm_path_list(value, expected):
+    assert split_edm_path_list(value) == expected

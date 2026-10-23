@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pydmconverter.edm.converter import convert
 from pydmconverter.scheme import load_scheme
+from pydmconverter.edm.display_roots import DISPLAY_ROOTS_ENV, resolve_display_roots
 from pathlib import Path
 import logging
 
@@ -43,6 +44,7 @@ def run(
     out_format="json",
     color_def=None,
     scheme=None,
+    display_roots=None,
 ):
     if target == "react":
         run_react(
@@ -54,6 +56,7 @@ def run(
             color_list=color_list,
             color_def=color_def,
             scheme=scheme,
+            display_roots=display_roots,
         )
         return
 
@@ -73,6 +76,7 @@ def run(
             site=site,
             calc_list_file=calc_list,
             color_list_file=color_list,
+            display_roots=display_roots,
         )
     else:
         if input_file_type[0] != ".":  # prepending . so it will not pick up other file types with same suffix
@@ -89,6 +93,7 @@ def run(
             site=site,
             calc_list=calc_list,
             color_list=color_list,
+            display_roots=display_roots,
         )
 
         if files_found == 0:
@@ -103,13 +108,23 @@ def run(
 
 
 def run_react(
-    input_file, output_file, override, site=None, calc_list=None, color_list=None, color_def=None, scheme=None
+    input_file,
+    output_file,
+    override,
+    site=None,
+    calc_list=None,
+    color_list=None,
+    color_def=None,
+    scheme=None,
+    display_roots=None,
 ) -> None:
     """Convert .edl/.ui/.bob to Canopy Screen IR JSON (the --target react path).
 
     ``color_list`` is an EDM ``colors.list`` palette applied to ``.edl`` inputs only. ``color_def`` is a
     Phoebus ``color.def`` applied to ``.bob`` inputs only. ``scheme`` is a loaded
     :class:`pydmconverter.scheme.SchemeResult` (or ``None``) passed through to the converter.
+    ``display_roots`` (``.edl`` inputs only) are absolute display directories
+    (see :mod:`pydmconverter.edm.display_roots`).
     """
     from pydmconverter import react
 
@@ -125,6 +140,7 @@ def run_react(
             site=site,
             color_def_path=color_def,
             scheme=scheme,
+            display_roots=display_roots,
         )
         print(f"Converted {input_path} -> {out}")
     else:
@@ -138,6 +154,7 @@ def run_react(
             site=site,
             color_def_path=color_def,
             scheme=scheme,
+            display_roots=display_roots,
         )
         if found == 0:
             print(f"No {' or '.join(react.SUPPORTED_SUFFIXES)} files found in {input_path}")
@@ -199,6 +216,7 @@ def run_cli(args: argparse.Namespace) -> None:
         out_format=args.format,
         color_def=args.color_def,
         scheme=scheme,
+        display_roots=args.display_roots,
     )
     if scheme_failed:
         sys.exit(1)
@@ -258,6 +276,7 @@ def convert_files_in_folder(
     site=None,
     calc_list=None,
     color_list=None,
+    display_roots=None,
 ) -> tuple[int, list[str]]:
     """Recursively runs convert on files in directory and subdirectories
 
@@ -300,6 +319,7 @@ def convert_files_in_folder(
                     site=site,
                     calc_list_file=calc_list,
                     color_list_file=color_list,
+                    display_roots=display_roots,
                 )
             except Exception as e:
                 files_failed.append(str(file))
@@ -317,6 +337,7 @@ def convert_files_in_folder(
             site=site,
             calc_list=calc_list,
             color_list=color_list,
+            display_roots=display_roots,
         )
         files_found += sub_found
         files_failed += sub_failed
@@ -338,6 +359,11 @@ def check_parser_errors(args: argparse.Namespace, parser: argparse.ArgumentParse
         parser.error("Must input two files or two folders")
     if not Path(args.input_file).is_file() and not Path(args.input_file).is_dir():
         parser.error(f"Input path '{args.input_file}' is neither a valid file nor a valid directory.")
+    # Here, not once per converted file.
+    try:
+        resolve_display_roots(args.display_roots)
+    except ValueError as e:
+        parser.error(str(e))
 
 
 def create_new_directories(args: argparse.Namespace) -> None:
@@ -402,6 +428,17 @@ def main() -> None:
         default=None,
         help="Path to a canopy-color-scheme/1 facility scheme; named colors it imports become color roles "
         "(--target react, .bob inputs). Scheme errors are printed and the exit status is non-zero",
+    )
+    parser.add_argument(
+        "--display-root",
+        dest="display_roots",
+        action="append",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Absolute EDM display directory: a related or embedded display named below it gets the name relative "
+            f"to it, for PYDM_DISPLAYS_PATH. Repeat for more than one (overrides {DISPLAY_ROOTS_ENV})"
+        ),
     )
     parser.add_argument(
         "--target",

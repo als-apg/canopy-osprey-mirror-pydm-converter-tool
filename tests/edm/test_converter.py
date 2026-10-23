@@ -1,10 +1,14 @@
 import json
+import os
+import subprocess
+import sys
 import xml.etree.ElementTree as ET
 import textwrap
 from pathlib import Path
 
 import pytest
 
+import pydmconverter
 from pydmconverter.edm.converter import convert, build_customwidgets_element, add_widgets_to_parent, content_extent
 from pydmconverter.widgets import PyDMLabel, PyDMFrame
 
@@ -270,6 +274,64 @@ def test_content_extent_ignores_unparseable_geometry():
 
     assert content_extent(elements, 100, 40) == (112, 50)
     assert content_extent([], 400, 300) == (400, 300)
+
+
+# Indented so a merge-conflict check doesn't read the markers as this file's own.
+CONFLICTED_LINE_SCREEN = textwrap.dedent("""\
+    4 0 1
+    beginScreenProperties
+    major 4
+    minor 0
+    release 1
+    x 0
+    y 0
+    w 300
+    h 200
+    endScreenProperties
+
+    # (Lines)
+    object activeLineClass
+    beginObjectProperties
+    major 4
+    minor 0
+    release 1
+    x 10
+    y 20
+    w 50
+    h 16
+    lineWidth 1
+    numPoints 2
+    xPoints {
+      0 10
+      1 60
+    }
+    yPoints {
+    <<<<<<< test.edl
+      0 20
+      1 36
+    =======
+      0 30
+      1 26
+    >>>>>>> 1.54
+    }
+    endObjectProperties
+""")
+
+
+def test_conflict_markers_in_line_points_keep_header_geometry(tmp_path, caplog):
+    """CVS conflict markers left in a points block: the line keeps its x/y/w/h
+    (as the IR target does) instead of failing the conversion, with warnings."""
+    input_file = tmp_path / "test.edl"
+    output_file = tmp_path / "test.ui"
+    input_file.write_text(CONFLICTED_LINE_SCREEN)
+
+    convert(str(input_file), str(output_file))
+
+    line = ET.parse(output_file).getroot().find(".//widget[@class='PyDMDrawingPolyline']")
+    rect = line.find("property[@name='geometry']/rect")
+    assert [int(rect.find(key).text) for key in ("x", "y", "width", "height")] == [10, 20, 50, 16]
+    assert f"CVS conflict markers in {input_file}" in caplog.text
+    assert "activeLineClass at (10, 20) has malformed points" in caplog.text
 
 
 def test_convert_with_explicit_color_list(tmp_path, monkeypatch):
@@ -846,16 +908,15 @@ def test_related_display_opens_each_file_with_its_own_macros(tmp_path, qtbot):
 def test_convert_related_display_pairs_menu_labels_with_filenames_by_index(tmp_path):
     """menuLabel { 1 .. 3 } labels displayFileName 1..3; display 0 keeps EDM's empty label.
 
-    The shape of lerf/mgnt_l1b_main.edl's "EPSC Hardware..." button: compacting
-    the labels handed display 0 the label of display 1, and so on.
+    Compacting the labels handed display 0 the label of display 1, and so on.
     """
     titles, filenames = _related_display_titles_and_filenames(
         tmp_path,
         "displayFileName {\n"
-        + "".join(f'  {i} "mgnt_epsc"\n' for i in range(4))
+        + "".join(f'  {i} "hardware"\n' for i in range(4))
         + '}\nmenuLabel {\n  1 "QCM03"\n  2 "XCM03"\n  3 "YCM03"\n}',
     )
-    assert filenames == ["mgnt_epsc.ui"] * 4
+    assert filenames == ["hardware.ui"] * 4
     assert titles == ["", "QCM03", "XCM03", "YCM03"]
 
 
@@ -1068,7 +1129,7 @@ def test_convert_meter_widget(tmp_path):
 
 @pytest.mark.parametrize("on_label, off_label, buttons", [("Cancel ", "Cancel", 1), ("Open", "Cancel", 2)])
 def test_message_button_off_variant_ignores_label_padding(tmp_path, on_label, off_label, buttons):
-    """Labels that differ only in padding (xray/vac_iso_valve.edl) get no separate off button."""
+    """Labels that differ only in padding get no separate off button."""
     edm_content = textwrap.dedent(f"""
         4 0 1
         beginScreenProperties
@@ -1106,8 +1167,34 @@ def test_message_button_off_variant_ignores_label_padding(tmp_path, on_label, of
     assert sum(widget.get("class") == "PyDMPushButton" for widget in widgets) == buttons
 
 
+def test_unlabelled_on_off_button_keeps_an_empty_label(tmp_path):
+    """EDM's default labelType (pvState) reads the state names from the PV while the
+    screen runs (button.cc). Converting can't, so both buttons keep an empty label."""
+    source = tmp_path / "button.edl"
+    source.write_text(
+        "4 0 1\nbeginScreenProperties\nmajor 4\nminor 0\nrelease 1\nx 0\ny 0\nw 200\nh 100\nendScreenProperties\n\n"
+        "object activeButtonClass\nbeginObjectProperties\nmajor 4\nminor 0\nrelease 0\nx 10\ny 10\nw 80\nh 20\n"
+        'onColor index 15\noffColor index 20\ncontrolPv "X:VALVE"\nendObjectProperties\n'
+    )
+    convert(str(source), str(tmp_path / "button.ui"))
+
+    buttons = [w for w in ET.parse(tmp_path / "button.ui").iter("widget") if w.get("class") == "PyDMPushButton"]
+    assert [button.find("property[@name='text']") for button in buttons] == [None, None]
+    # The off and on buttons show by turns on the control PV's state.
+    visible = [
+        rule
+        for button in buttons
+        for rule in json.loads(button.find("property[@name='rules']/string").text)
+        if rule["name"] == "Visible"
+    ]
+    assert sorted((rule["expression"], rule["channels"][0]["channel"]) for rule in visible) == [
+        ("(ch[0]!=1)", "X:VALVE"),
+        ("(ch[0]==1)", "X:VALVE"),
+    ]
+
+
 def test_convert_warns_when_a_shell_variable_shares_a_macro_name(tmp_path, caplog):
-    r"""camac/camac_lu_from_epics_detail.edl: $\{LOCA\} (a shell variable) next to the
+    r"""$\{LOCA\} (a shell variable) next to the
     $(LOCA) macro. Both read as ${LOCA}, which PyDM substitutes."""
     source = tmp_path / "shell.edl"
     source.write_text(
@@ -1119,3 +1206,104 @@ def test_convert_warns_when_a_shell_variable_shares_a_macro_name(tmp_path, caplo
     assert "luCWRestart ${LOCA} ${LOCA} ${HOME}" in (tmp_path / "shell.ui").read_text()
     (warning,) = [r.getMessage() for r in caplog.records if "shares its name with a macro" in r.getMessage()]
     assert warning.endswith(": LOCA")
+
+
+NESTED_VISIBILITY = textwrap.dedent("""\
+    4 0 1
+    beginScreenProperties
+    major 4
+    minor 0
+    release 1
+    x 0
+    y 0
+    w 200
+    h 200
+    endScreenProperties
+
+    object activeGroupClass
+    beginObjectProperties
+    major 4
+    minor 0
+    release 0
+    x 10
+    y 10
+    w 100
+    h 100
+
+    beginGroup
+
+    object activeGroupClass
+    beginObjectProperties
+    major 4
+    minor 0
+    release 0
+    x 20
+    y 20
+    w 50
+    h 50
+
+    beginGroup
+
+    object activeRectangleClass
+    beginObjectProperties
+    major 4
+    minor 0
+    release 0
+    x 30
+    y 30
+    w 20
+    h 20
+    lineColor index 14
+    visPv "$(P):OWN"
+    visMin "1"
+    visMax "2"
+    endObjectProperties
+
+    endGroup
+
+    visPv "$(P):INNER"
+    visInvert
+    endObjectProperties
+
+    endGroup
+
+    visPv "$(P):OUTER"
+    endObjectProperties
+    """)
+
+
+def test_rule_order_does_not_depend_on_hash_seed(tmp_path):
+    """A rectangle inside two groups with visPvs has three Visible terms. Converted in
+    fresh interpreters with different string hash seeds, they keep one order: the
+    outer group's, the inner group's, then the rectangle's own."""
+    source = tmp_path / "nested.edl"
+    source.write_text(NESTED_VISIBILITY)
+    # The tree under test, not whatever pydmconverter the interpreter would find first.
+    package_root = str(Path(pydmconverter.__file__).resolve().parents[1])
+    code = "import sys; from pydmconverter.edm.converter import convert; convert(sys.argv[1], sys.argv[2])"
+    rules_by_seed = {}
+    for seed in ("1", "2", "3", "4"):
+        output = tmp_path / f"nested_{seed}.ui"
+        env = dict(os.environ, PYTHONHASHSEED=seed, QT_QPA_PLATFORM="offscreen")
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(source), str(output)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        rectangle = next(
+            w for w in ET.parse(output).getroot().iter("widget") if w.get("class") == "PyDMDrawingRectangle"
+        )
+        rules_by_seed[seed] = json.loads(rectangle.find("property[@name='rules']/string").text)
+
+    (visible,) = [r for r in rules_by_seed["1"] if r["property"] == "Visible"]
+    assert [c["channel"] for c in visible["channels"]] == ["${P}:OUTER", "${P}:INNER", "${P}:OWN"]
+    # The groups have no visMin/visMax, which EDM reads as 0: the empty range [0, 0).
+    assert visible["expression"] == (
+        "(float(ch[0]) >= 0.0 and float(ch[0]) < 0.0) and (float(ch[1]) < 0.0 or float(ch[1]) >= 0.0)"
+        " and (float(ch[2]) >= 1.0 and float(ch[2]) < 2.0)"
+    )
+    assert all(rules == rules_by_seed["1"] for rules in rules_by_seed.values())

@@ -138,10 +138,12 @@ def test_screen_ref_rewrites_to_screen_json():
     assert screen_ref("motor-simple.ui") == "motor-simple.screen.json"
     assert screen_ref("sub/dir/foo.edl") == "sub/dir/foo.screen.json"
     assert screen_ref("Collimator/Widget.ui") == "Collimator/Widget.screen.json"
+    # a PyDM Python display (a converted menu-mux screen around menu.ui)
+    assert screen_ref("sub/menu.py") == "sub/menu.screen.json"
     # filenames stringlist -> first, rewritten
     assert screen_ref(["a.ui", "b.ui"]) == "a.screen.json"
     # extensionless PyDM related-display target -> append
-    assert screen_ref("mc_li21_coll") == "mc_li21_coll.screen.json"
+    assert screen_ref("collimator") == "collimator.screen.json"
     # already-converted / macro refs left sensible
     assert screen_ref("x.screen.json") == "x.screen.json"
     assert screen_ref("${SCREEN}") == "${SCREEN}"

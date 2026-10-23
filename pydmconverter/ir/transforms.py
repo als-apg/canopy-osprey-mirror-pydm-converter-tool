@@ -153,7 +153,8 @@ def screen_ref(value: Any) -> Any:
     lowered = ref.lower()
     if lowered.endswith(".screen.json"):
         return ref
-    for ext in _SCREEN_SOURCE_EXTENSIONS:
+    # X.py is a PyDM Python display, e.g. a converted menu-mux screen around X.ui.
+    for ext in (*_SCREEN_SOURCE_EXTENSIONS, ".py"):
         if lowered.endswith(ext):
             return ref[: -len(ext)] + ".screen.json"
     # Extensionless targets get the extension appended; macro refs can't be

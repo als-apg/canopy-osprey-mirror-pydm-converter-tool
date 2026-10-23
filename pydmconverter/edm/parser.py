@@ -1,5 +1,6 @@
 import re
 import os
+import struct
 from functools import partial
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from pydmconverter.edm.parser_helpers import (
     resolve_inside,
     search_color_list,
     replace_calc_and_loc_in_edm_content,
+    split_edm_path_list,
 )
 from pydmconverter.ir.source import exception_detail
 import logging
@@ -27,6 +29,8 @@ _PV_TAG_RE = re.compile(r"\w*(?:Pv|Pvs|PvStr)|pv")
 # A quoted EDM value up to its closing quote or line break, escapes included.
 _QUOTED_VALUE_RE = re.compile(r'"((?:[^"\\\n]|\\[^\n])*)')
 _ESCAPE_RE = re.compile(r"\\(.)")
+# A merge-conflict marker line ("<<<<<<< file.edl", "=======", ">>>>>>> 1.54").
+_CONFLICT_MARKER_RE = re.compile(r"^(?:<{7}|={7}|>{7})(?: |$)", re.MULTILINE)
 
 
 def read_edm_string(value: str, literal_brace: str | None = None) -> str:
@@ -127,15 +131,51 @@ def edm_int(value) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _edm_flag(value) -> bool:
+    """EDM's read of a flag tag: 1 for a bare tag (parsed as True), else its integer."""
+    return value is True or edm_int(value) != 0
+
+
+def closing_display_indices(properties: dict) -> set[int]:
+    """The related display entries (EDM array indices) that close the parent window
+    after opening their display.
+
+    EDM (related_display.cc) reads the ``closeAction`` and ``closeDisplay`` tags
+    into the same closeAction array, each setting only the indices it lists, so
+    where a file writes both for one index the later tag wins.
+
+    popupDisplay closes the parent only when the display isn't a popup, so none
+    close with ``button3Popup`` (a right-click popup) or with ``useFocus`` on a
+    button of one menu item (a hover popup). EDM counts numDsps menu items, less
+    a ``helpCommand "item N"`` entry, which this doesn't model.
+    """
+    if _edm_flag(properties.get("button3Popup")) or (
+        _edm_flag(properties.get("useFocus")) and edm_int(properties.get("numDsps")) <= 1
+    ):
+        return set()
+    flags: dict[int, bool] = {}
+    for name, value in properties.items():
+        if name in ("closeAction", "closeDisplay"):
+            flags.update((index, edm_int(flag) != 0) for index, flag in block_items(value))
+    return {index for index, closes in flags.items() if closes}
+
+
 def _read_edm_text(path) -> str:
-    """Read an EDM file as text, falling back to Latin-1 when it isn't valid UTF-8."""
+    """Read an EDM file as text, falling back to Latin-1 when it isn't valid UTF-8.
+
+    Warns when the file holds CVS merge-conflict markers: the converter does not
+    resolve them, so both sides of each conflict are read as tags.
+    """
     try:
         with open(path, "r") as file:
-            return file.read()
+            text = file.read()
     except UnicodeDecodeError as e:
         logger.warning(f"Could not read file as UTF-8 (bad byte at {e.start}): {e}. Switching to Latin-1...")
         with open(path, "r", encoding="latin-1") as file:
-            return file.read()
+            text = file.read()
+    if _CONFLICT_MARKER_RE.search(text):
+        logger.warning(f"CVS conflict markers in {path}: objects inside a conflict may get wrong values")
+    return text
 
 
 def _resolve_or_none(path: str | Path) -> Path | None:
@@ -207,6 +247,103 @@ def _move_edm_object(obj: EDMObjectBase, dx: int, dy: int) -> None:
             _move_edm_object(child, dx, dy)
     elif isinstance(obj, EDMObject):
         _map_line_points(obj, lambda px, py: (px + dx, py + dy))
+
+
+def _edm_round(value: float) -> int:
+    """EDM's ``(int) ( v + 0.5 )``: the cast truncates toward zero, so -1.5 gives -1 (not ``round``)."""
+    return int(value + 0.5)
+
+
+def _edm_float(value: float) -> float:
+    """``value`` rounded to a C ``float``, the type activeLineClass::updateDimensions works in."""
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def _scale_ratio(new: int, old: int) -> float:
+    """activeGroupClass's scale factor ``_w / w``. EDM divides by zero for a 0-wide
+    or 0-high group; it is taken as 1 here."""
+    return new / old if old else 1.0
+
+
+# Classes whose own checkResizeSelectBoxAbs refuses under a fixed width or
+# height instead of activeGraphicClass's 2; None refuses any resize.
+_RESIZE_MINIMUM: dict[str, int | None] = {
+    "activepngclass": None,  # pnglib/png.cc: "no resize allowed"
+    "cfcf6c8a_dbeb_11d2_8a97_00104b8742df": None,  # activeGifClass (giflib/gif.cc)
+    "textupdateclass": 10,  # pvFactory/textupdate.cc, inherited by the two below
+    "textentryclass": 10,
+    "regtextupdateclass": 10,
+    "activetableclass": 10,  # baselib/table.cc
+    "activecoeftableclass": 10,  # baselib/coefTable.cc
+}
+
+
+def _resize_check(objs: list[EDMObjectBase], sx: float, sy: float) -> str | None:
+    """Why EDM's checkResizeSelectBoxAbs would refuse to scale ``objs`` by (sx, sy), or None.
+
+    An object whose scaled width or height would be under 2 refuses
+    (activeGraphicClass), a line never does (activeLineClass), and a group asks
+    its children with its own rounded ratio (activeGroupClass). A symbol inside
+    the symbol refuses too: EDM scales one unless it has ``useOriginalSize``, but
+    its expanded group here keeps neither that flag nor its saved size.
+
+    Some classes ask for more (``_RESIZE_MINIMUM``): an image refuses any resize,
+    a text update or table anything under 10. Bars, meters, sliders and the like
+    work out their minimum from their font, which the converter doesn't, so they
+    are held to 2.
+    """
+    for obj in objs:
+        w, h = _edm_round(obj.width * sx), _edm_round(obj.height * sy)
+        if isinstance(obj, EDMGroup):
+            if obj.is_symbol:
+                return "EDM symbol holds a symbol, which the converter does not scale; drawn at the symbol file's size"
+            reason = _resize_check(obj.objects, _scale_ratio(w, obj.width), _scale_ratio(h, obj.height))
+            if reason:
+                return reason
+        elif isinstance(obj, EDMObject) and obj.name.lower() in _RESIZE_MINIMUM:
+            minimum = _RESIZE_MINIMUM[obj.name.lower()]
+            if minimum is None or w < minimum or h < minimum:
+                return "EDM symbol resize underflow; drawn at the symbol file's size"
+        elif (w < 2 or h < 2) and not (isinstance(obj, EDMObject) and obj.name.lower() == "activelineclass"):
+            return "EDM symbol resize underflow; drawn at the symbol file's size"
+    return None
+
+
+def _resize_children(objs: list[EDMObjectBase], ax: int, ay: int, x: int, y: int, sx: float, sy: float) -> None:
+    """Scale ``objs`` by (sx, sy) about (ax, ay) and put that point at (x, y), as
+    activeGroupClass/activeSymbolClass::resizeAbs do with their children."""
+    for obj in objs:
+        _resize_edm_object(
+            obj,
+            x + _edm_round((obj.x - ax) * sx),
+            y + _edm_round((obj.y - ay) * sy),
+            _edm_round(obj.width * sx),
+            _edm_round(obj.height * sy),
+        )
+
+
+def _resize_edm_object(obj: EDMObjectBase, x: int, y: int, w: int, h: int) -> None:
+    """EDM's resizeAbs(): give ``obj`` the rect (x, y, w, h).
+
+    A group scales its children by its own ratio, new size over old
+    (activeGroupClass). A line stretches its points from the old rect to the new
+    one in float and clamps them into it (activeLineClass::updateDimensions,
+    with a 0 width or height taken as 1). Anything else only takes the rect: a
+    text keeps its font, an arc its angles, and every object its lineWidth.
+    """
+    if isinstance(obj, EDMGroup):
+        _resize_children(obj.objects, obj.x, obj.y, x, y, _scale_ratio(w, obj.width), _scale_ratio(h, obj.height))
+    elif isinstance(obj, EDMObject):
+        old_x, old_y = obj.x, obj.y
+        x_stretch, y_stretch = _edm_float(w / (obj.width or 1)), _edm_float(h / (obj.height or 1))
+        _map_line_points(
+            obj,
+            lambda px, py: (
+                min(max(x + _edm_round(_edm_float((px - old_x) * x_stretch)), x), x + w),
+                min(max(y + _edm_round(_edm_float((py - old_y) * y_stretch)), y), y + h),
+            ),
+        )
+    obj.x, obj.y, obj.width, obj.height = x, y, w, h
 
 
 def _reorient_point(orientation: str, ox: int, oy: int, px: int, py: int) -> tuple[int, int]:
@@ -351,6 +488,11 @@ class EDMFileParser:
         self.text = _read_edm_text(file_path)
         self.modify_text(file_path)
 
+        # Set by convert_edm_to_pydm_widgets: the menu muxes that make the menu screen
+        # (.py) and the loc:// declarations it shares with the .ui.
+        self.menu_mux_buttons: list[EDMObject] = []
+        self.menu_loc_declarations: dict[str, str] = {}
+
         self.screen_properties_end = 0
         self.ui = EDMGroup()
         # Screen dimensions ("width"/"height") the file does not declare as integers;
@@ -368,7 +510,10 @@ class EDMFileParser:
         self.text = self.text.replace(
             "$(!A)", ""
         )  # remove global macros TODO: In edm, these macros (!W) and (!A) are used to specify the scope of the macros (outside of a specific screen) this may need to be resolved more cleanly later
-        pattern = r"\\*\$\(([^)]+)\)"
+        # Backslashes before a macro stay: EDM expands $(SIG) in LOC\\$(SIG)_View=0
+        # and keeps the backslash (expString.cc), which PV_Factory then splits on
+        # (pv_factory.cc), so the LOC\ prefix must survive to the conversion below.
+        pattern = r"\$\(([^)]+)\)"
         self.text = re.sub(pattern, r"${\1}", self.text)
         self.text, _, _ = replace_calc_and_loc_in_edm_content(
             self.text,
@@ -574,8 +719,15 @@ class EDMFileParser:
             return EDMGroup(**size_properties, properties={"symbolFileOutsideSearchPaths": embedded_file})
         if found is None:
             # Keep the symbol's rect and name the missing file so the IR adapter can
-            # attach a node warning (nothing may disappear silently).
-            return EDMGroup(**size_properties, properties={"symbolFileNotFound": embedded_file})
+            # attach a node warning (nothing may disappear silently). A confined lookup
+            # never searched EDMDATAFILES, so its warning must not point there.
+            return EDMGroup(
+                **size_properties,
+                properties={
+                    "symbolFileNotFound": embedded_file,
+                    "symbolSearchedEdmDataFiles": not self.confine_file_refs,
+                },
+            )
         symbol_path, embedded_text = found
         if symbol_path in self._symbol_stack:
             # Expanding it again would never end (it used to raise RecursionError).
@@ -616,13 +768,21 @@ class EDMFileParser:
         EDM reads the file's top-level objects in order as the states and stops at
         the first one that is not a group (states read so far are kept). A symbol
         with no control PV (``numPvs`` 0 or absent, EDM's default, or a blank
-        ``controlPvs`` entry) draws state 1 only.
+        ``controlPvs`` entry) draws state 1 only. The states are then scaled to the
+        symbol's saved size and, last, rotated or flipped (symbol.cc createFromFile).
         """
         temp_group = EDMGroup()
         warnings: list[str] = []
         match = self.screen_prop_pattern.search(embedded_text)
         screen_properties_end = match.end() if match else 0
         self.parse_objects_and_groups(embedded_text[screen_properties_end:], temp_group)
+        # symbol.cc createFromFile: if ( numStates < 1 ) numStates = 1;
+        num_states = max(1, edm_int(properties.get("numStates")))
+        # readSymbolFile fails when one of the first numStates objects is not a
+        # group; EDM then does not scale the symbol.
+        read_ok = bool(temp_group.objects) and all(
+            isinstance(obj, EDMGroup) and not obj.is_symbol for obj in temp_group.objects[:num_states]
+        )
         states: list[EDMGroup] = []
         for obj in temp_group.objects:
             if not isinstance(obj, EDMGroup):
@@ -638,11 +798,12 @@ class EDMFileParser:
         control_pvs = [pv for _, pv in block_items(properties.get("controlPvs"))]
         has_control = 0 < num_pvs <= len(control_pvs) and all(pv.strip() for pv in control_pvs[:num_pvs])
         self.resize_symbol_groups(temp_group, size_properties)
+        box = None
+        if read_ok:
+            box = self.scale_symbol_groups(temp_group, properties, size_properties, num_states, warnings)
         self.add_symbol_properties(temp_group, properties)
         if "orientation" in properties:
-            # symbol.cc createFromFile: if ( numStates < 1 ) numStates = 1;
-            num_states = max(1, edm_int(properties.get("numStates")))
-            self.reorient_symbol_groups(temp_group, properties["orientation"], size_properties, num_states)
+            self.reorient_symbol_groups(temp_group, properties["orientation"], size_properties, num_states, box)
         if not has_control:
             # symbol.cc: controlExists = 0 -> index = 1; drawActive draws state 1 only.
             # Pick it from the full state list: remove_extra_groups keeps only
@@ -659,6 +820,15 @@ class EDMFileParser:
         if warnings:
             temp_group.properties["symbolWarnings"] = warnings
         return temp_group
+
+    def edm_search_dirs(self) -> list[str]:
+        """The directories EDM looks in for a file the display names, in order: the
+        display's own directory, then ``search_paths``, then ``EDMDATAFILES`` (which a
+        confined parser skips)."""
+        dirs = [str(Path(self.file_path).parent), *self.search_paths]
+        if not self.confine_file_refs:
+            dirs.extend(split_edm_path_list(os.environ.get("EDMDATAFILES", ".")))
+        return dirs
 
     def _find_symbol_file(self, embedded_file: str) -> tuple[Path, str] | None:
         """
@@ -677,15 +847,7 @@ class EDMFileParser:
             no candidate inside the allowed roots also adds the name to
             ``_symbols_outside``.
         """
-        # EDM resolves symbol files beside the calling display first, then along
-        # EDMDATAFILES (explicit search_paths go before it). Split on ":" only when
-        # it is not a Windows drive colon (":" followed by a path separator), and
-        # accept ";" separators too. Confined lookups skip EDMDATAFILES.
-        edm_paths: list[str] = [str(Path(self.file_path).parent), *self.search_paths]
-        if not self.confine_file_refs:
-            datafiles = os.environ.get("EDMDATAFILES", ".")
-            for chunk in datafiles.split(";"):
-                edm_paths.extend(p for p in re.split(r":(?![\\/])", chunk) if p)
+        edm_paths = self.edm_search_dirs()
         any_in_bounds = False
         for path in edm_paths:
             if self.confine_file_refs:
@@ -703,6 +865,8 @@ class EDMFileParser:
         if self.confine_file_refs and not any_in_bounds:
             logger.warning(f"Symbol file {embedded_file!r} is outside the search paths; not read")
             self._symbols_outside.add(embedded_file)
+        elif self.confine_file_refs:
+            logger.warning(f"Symbol file {embedded_file!r} not found beside the display or on the search paths")
         else:
             logger.warning(
                 f"Symbol file {embedded_file!r} not found beside the display, on the search paths or on EDMDATAFILES"
@@ -732,15 +896,79 @@ class EDMFileParser:
             sub_group.x = size_properties["x"]
             sub_group.y = size_properties["y"]
 
+    def scale_symbol_groups(
+        self,
+        temp_group: EDMGroup,
+        properties: dict[str, bool | str | list[str]],
+        size_properties: dict[str, int],
+        num_states: int,
+        warnings: list[str],
+    ) -> tuple[int, int]:
+        """
+        Given a group of symbol groups moved to the symbol's position, scale every
+        state to the symbol's saved size, as EDM does unless the symbol has
+        ``useOriginalSize`` (symbol.cc createFromFile). readSymbolFile leaves the
+        symbol as wide and tall as the largest of the first ``num_states`` groups
+        (w = maxW; h = maxH); when the saved w/h differ, resizeAbs scales the
+        content of every state by saved/max, per axis, about the symbol's top-left
+        corner.
+
+        EDM refuses when an object would end up under 2 pixels wide or high
+        ("Symbol resize underflow - using original size"); the symbol then keeps
+        the symbol file's size and a warning is added to ``warnings``.
+
+        Parameters
+        ----------
+        temp_group: EDMGroup
+            The EDMGroup making up each symbol group whose objects will be modified
+        properties: dict[str, bool | str | list[str]]
+            Object properties from the activesymbolclass
+        size_properties : dict[str, int]
+            The coordinate and size_properties of the activesymbolclass
+        num_states : int
+            The symbol's numStates (at least 1); groups past it don't size the symbol
+        warnings : list[str]
+            The symbol's warnings, extended when EDM would refuse to scale it
+
+        Returns
+        ----------
+        tuple[int, int]
+            The symbol's width and height afterwards
+        """
+        read = temp_group.objects[:num_states]
+        max_w = max((state.width for state in read), default=0)
+        max_h = max((state.height for state in read), default=0)
+        save_w, save_h = size_properties["width"], size_properties["height"]
+        # EDM reads a bare useOriginalSize tag as 1 and its absence as 0.
+        flag = properties.get("useOriginalSize")
+        use_original_size = flag is True or edm_int(flag) != 0
+        # A 0 (or negative) read or saved size gives no usable scale; keep the file's size.
+        if use_original_size or (save_w, save_h) == (max_w, max_h) or min(max_w, max_h, save_w, save_h) <= 0:
+            return max_w, max_h
+        sx, sy = save_w / max_w, save_h / max_h
+        warning = _resize_check([obj for state in read for obj in state.objects], sx, sy)
+        if warning:
+            warnings.append(warning)
+            return max_w, max_h
+        x, y = size_properties["x"], size_properties["y"]
+        for state in temp_group.objects:
+            _resize_children(state.objects, x, y, x, y, sx, sy)
+            state.width, state.height = _edm_round(state.width * sx), _edm_round(state.height * sy)
+        return save_w, save_h
+
     def reorient_symbol_groups(
-        self, temp_group: EDMGroup, orientation: str, size_properties: dict[str, int], num_states: int = 1
+        self,
+        temp_group: EDMGroup,
+        orientation: str,
+        size_properties: dict[str, int],
+        num_states: int = 1,
+        box: tuple[int, int] | None = None,
     ) -> None:
         """
         Given a group of symbol groups, rotate (rotateCW, rotateCCW) or flip
         (FlipV, FlipH) every state group and everything in it, nested groups
         included, about the symbol's midpoint (symbol.cc createFromFile calls
-        rotateInternal/flipInternal at getXMid(), getYMid()). The symbol's rect
-        comes from the first ``num_states`` groups only, the ones EDM reads.
+        rotateInternal/flipInternal at getXMid(), getYMid(), after any scaling).
 
         Parameters
         ----------
@@ -752,15 +980,19 @@ class EDMFileParser:
             The coordinate and size_properties of the activesymbolclass
         num_states : int
             The symbol's numStates (at least 1); groups past it don't size the symbol
+        box : tuple[int, int], optional
+            The symbol's width and height from :meth:`scale_symbol_groups`. Without
+            it, the largest of the first ``num_states`` groups, the ones EDM reads.
         """
         if orientation not in SYMBOL_ORIENTATIONS or not temp_group.objects:
             return
-        # readSymbolFile reads only the first numStates groups and leaves the symbol
-        # as wide and tall as the largest of those (w = maxW; h = maxH); the converter
-        # never scales a symbol to its saved size, so that is its rect.
-        read = temp_group.objects[:num_states]
-        ox = size_properties["x"] + max(state.width for state in read) // 2
-        oy = size_properties["y"] + max(state.height for state in read) // 2
+        if box is None:
+            # readSymbolFile leaves the symbol as wide and tall as the largest of the
+            # numStates groups it reads (w = maxW; h = maxH).
+            read = temp_group.objects[:num_states]
+            box = (max(state.width for state in read), max(state.height for state in read))
+        ox = size_properties["x"] + box[0] // 2
+        oy = size_properties["y"] + box[1] // 2
         for state in temp_group.objects:
             _reorient_edm_object(state, orientation, ox, oy)
 
@@ -833,11 +1065,26 @@ class EDMFileParser:
         num_states = edm_int(properties.get("numStates"))
         if len(block_items(properties.get("controlPvs"))) > 1:
             logger.warning(f"This symbol object has more than one pV: {properties}")
+        symbol_channel = self._symbol_channel(properties)
         for i in range(
             min(len(temp_group.objects), num_states)
         ):  # TODO: Figure out what happens when numStates < temp_group.objects
+            # The state's range and the channel it is read from travel together:
+            # the .ui converter builds the state's visibility rule from all three.
             temp_group.objects[i].properties["symbolMin"] = ranges[i][0]
             temp_group.objects[i].properties["symbolMax"] = ranges[i][1]
+            temp_group.objects[i].properties["symbolChannel"] = symbol_channel
+        if temp_group.objects and num_states > 0:
+            # EDM shows state 0 when no state's range holds the value (symbol.cc
+            # executeDeferred: index = 0 unless a range matches), so state 0 also
+            # shows outside every other state's range, states with no group included.
+            temp_group.objects[0].properties["symbolOtherRanges"] = ranges[1:num_states]
+
+    @staticmethod
+    def _symbol_channel(properties: dict[str, bool | str | list[str]]) -> str | None:
+        """The PV a symbol picks its state from: its first control PV, by EDM index."""
+        control_pvs = [pv for _, pv in sorted(block_items(properties.get("controlPvs")))]
+        return control_pvs[0] if control_pvs else None
 
     def add_symbol_properties(self, temp_group: EDMGroup, properties: dict[str, bool | str | list[str]]) -> None:
         """
@@ -851,8 +1098,7 @@ class EDMFileParser:
         properties: dict[str, bool | str | list[str]]
             Object properties from the activesymbolclass
         """
-        control_pvs = [pv for _, pv in sorted(block_items(properties.get("controlPvs")))]
-        symbol_channel = control_pvs[0] if control_pvs else None
+        symbol_channel = self._symbol_channel(properties)
 
         for sub_group in temp_group.objects:
             for sub_object in sub_group.objects:

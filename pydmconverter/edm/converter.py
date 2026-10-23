@@ -2,10 +2,14 @@ from pathlib import Path
 from pydmconverter.edm.parser import EDMFileParser, EDMObject, literal_macro_clashes
 import xml.etree.ElementTree as ET
 from pydmconverter.edm.converter_helpers import convert_edm_to_pydm_widgets
+from pydmconverter.edm.menu_links import link_menu_screens
+from pydmconverter.edm.menumux import generate_menumux_file
 from pydmconverter.edm.window_macros import resolve_window_macros
+from pydmconverter.sites import get_skip_widgets
 import logging
 
 from pydmconverter.widgets_helpers import PageHeader
+from pydmconverter.edm.converter_helpers import start_rules_at_loc_inits
 
 logger = logging.getLogger(__name__)
 
@@ -53,10 +57,33 @@ CUSTOM_WIDGET_DEFINITIONS = {
 }
 
 
-def convert(input_path, output_path, scrollable=False, site=None, calc_list_file=None, color_list_file=None):
+def convert(
+    input_path,
+    output_path,
+    scrollable=False,
+    site=None,
+    calc_list_file=None,
+    color_list_file=None,
+    search_paths=None,
+    display_roots=None,
+):
+    """Convert an EDM .edl file to a PyDM .ui (plus a .py when it has menu muxes).
+
+    ``search_paths`` are extra directories searched, after the file's own directory
+    and before ``EDMDATAFILES``, for symbol files, calc.list and the displays its links
+    open.
+
+    ``display_roots`` are absolute directories whose display names become root-relative
+    (see :mod:`pydmconverter.edm.display_roots`); ``PYDMCONVERTER_DISPLAY_ROOTS`` when
+    omitted.
+    """
     try:
         edm_parser = EDMFileParser(
-            input_path, output_path, calc_list_file=calc_list_file, color_list_file=color_list_file
+            input_path,
+            output_path,
+            calc_list_file=calc_list_file,
+            color_list_file=color_list_file,
+            search_paths=search_paths,
         )
         logger.info(f"Successfully parsed EDM file: {input_path}")
     except FileNotFoundError:
@@ -73,7 +100,9 @@ def convert(input_path, output_path, scrollable=False, site=None, calc_list_file
 
     # edm_parser.ui, _, _ = replace_calc_and_loc_in_edm_content(edm_parser.ui, input_path)
 
-    pydm_widgets, used_classes = convert_edm_to_pydm_widgets(edm_parser, site=site, color_list_file=color_list_file)
+    pydm_widgets, used_classes = convert_edm_to_pydm_widgets(
+        edm_parser, site=site, color_list_file=color_list_file, display_roots=display_roots
+    )
     logger.info(f"Converted EDM objects to {len(pydm_widgets)} PyDM widgets.")
 
     # Serialize each widget once and measure those same elements: to_xml() is not idempotent
@@ -91,6 +120,7 @@ def convert(input_path, output_path, scrollable=False, site=None, calc_list_file
         style_sheet_elem.text = f"background-color: {bg_color};"
 
     central_widget.extend(widget_elements)
+    start_rules_at_loc_inits(ui_element)
 
     customwidgets_el = build_customwidgets_element(used_classes)
     ui_element.append(customwidgets_el)
@@ -99,10 +129,18 @@ def convert(input_path, output_path, scrollable=False, site=None, calc_list_file
     ET.SubElement(ui_element, "connections")
 
     resolve_window_macros(ui_element, Path(output_path).stem)
+    link_menu_screens(ui_element, edm_parser.edm_search_dirs(), get_skip_widgets(site))
     ET.indent(ui_element, space="  ", level=0)
 
     tree = ET.ElementTree(ui_element)
     tree.write(output_path, encoding="utf-8", xml_declaration=True)
+
+    # The menu screen embeds the .ui, so it is written last: a conversion that fails
+    # leaves no menu screen pointing at a missing or stale .ui.
+    if edm_parser.menu_mux_buttons:
+        generate_menumux_file(
+            edm_parser.menu_mux_buttons, edm_parser.output_file_path, edm_parser.menu_loc_declarations
+        )
 
 
 QT_BASE_CLASSES = {"QPushButton", "QTabWidget", "QFrame", "QLabel", "QWidget", "QLineEdit", "QComboBox", "QTableWidget"}

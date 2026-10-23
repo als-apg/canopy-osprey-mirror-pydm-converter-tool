@@ -29,7 +29,6 @@ from pydmconverter.widgets_helpers import (
     _json_text,
 )
 import logging
-from epics import PV
 
 
 def edm_to_ui_filename(file_string: str) -> str:
@@ -39,9 +38,9 @@ def edm_to_ui_filename(file_string: str) -> str:
     A name that is already a ".ui" file is returned unchanged. Otherwise any
     legacy macro suffix ("name.edl;P=...") is dropped at the first ";", a
     trailing ".edl" is stripped, and ".ui" is appended. EDM appends ".edl" to a
-    name that lacks the suffix, so "GigE_controls" and "GigE_controls.edl" both
-    become "GigE_controls.ui". Dots anywhere else stay part of the name, so
-    "GigE_v1.2" becomes "GigE_v1.2.ui" and "screen.edl.bak" becomes
+    name that lacks the suffix, so "camera_controls" and "camera_controls.edl" both
+    become "camera_controls.ui". Dots anywhere else stay part of the name, so
+    "cam_v1.2" becomes "cam_v1.2.ui" and "screen.edl.bak" becomes
     "screen.edl.bak.ui".
     """
     if file_string.endswith(".ui"):
@@ -50,6 +49,31 @@ def edm_to_ui_filename(file_string: str) -> str:
     if name.endswith(".edl"):
         name = name[: -len(".edl")]
     return f"{name}.ui"
+
+
+# edm_to_ui_filename as a PyDM rule expression on the channel's value, after
+# stripping it. A blank value, or one that is not a string yet (an enum's index
+# before its strings arrive), gives "", which embeds nothing.
+FILENAME_RULE_EXPRESSION = (
+    "(lambda s: '' if not s else s if s.endswith('.ui') else "
+    "(lambda n: (n[:-4] if n.endswith('.edl') else n) + '.ui')(s.partition(';')[0]))"
+    "(ch[0].strip() if isinstance(ch[0], str) else '')"
+)
+
+
+def filename_rule(channel: str) -> Dict[str, Any]:
+    """A PyDMEmbeddedDisplay rule that embeds the display the channel's value names.
+
+    use_enum makes an enum PV give its state string, as EDM's get_string does.
+    """
+    return {
+        "name": "Filename",
+        "property": "Filename",
+        "initial_value": "",
+        "expression": FILENAME_RULE_EXPRESSION,
+        "channels": [{"channel": channel, "trigger": True, "use_enum": True}],
+        "notes": "",
+    }
 
 
 @dataclass
@@ -206,11 +230,16 @@ class PyDMLabel(QLabel, Alarmable):
     precision_from_pv : Optional[bool]
         If True, the numerical precision is determined from the process variable.
         If None, no such property is added.
+    display_label_text : Optional[bool]
+        If True, the label keeps its own text instead of showing the channel's
+        value; the channel only colours it for alarms (PyDM >= 1.29).
+        If None, no such property is added.
     count : ClassVar[int]
         A class variable tracking the number of PyDMLabel instances.
     """
 
     precision_from_pv: Optional[bool] = None
+    display_label_text: Optional[bool] = None
     autoSize: bool = False
 
     def __post_init__(self):
@@ -238,6 +267,8 @@ class PyDMLabel(QLabel, Alarmable):
         properties: List[ET.Element] = super().generate_properties()
         if self.precision_from_pv is not None:
             properties.append(Bool("precisionFromPV", self.precision_from_pv).to_xml())
+        if self.display_label_text is not None:
+            properties.append(Bool("displayLabelText", self.display_label_text).to_xml())
         if self.autoSize:
             properties.append(Bool("autoSize", True).to_xml())
         return properties
@@ -308,7 +339,7 @@ class PyDMDrawingRectangle(Alarmable, Drawable, Hidable):
 
 
 @dataclass
-class PyDMDrawingEllipse(Alarmable, Drawable, Hidable, StyleSheetObject):
+class PyDMDrawingEllipse(Alarmable, Drawable, Hidable):
     """
     PyDMDrawingEllipse represents a drawable ellipse that supports XML serialization,
     alarm functionality, and can be hidden.
@@ -321,9 +352,11 @@ class PyDMDrawingEllipse(Alarmable, Drawable, Hidable, StyleSheetObject):
         A class variable tracking the number of PyDMDrawingEllipse instances.
     """
 
+    transparent_when_filled: ClassVar[bool] = True
+
 
 @dataclass
-class PyDMDrawingArc(Alarmable, Drawable, Hidable, StyleSheetObject):
+class PyDMDrawingArc(Alarmable, Drawable, Hidable):
     """
     PyDMDrawingArc represents a drawable ellipse that supports XML serialization,
     alarm functionality, and can be hidden.
@@ -333,6 +366,7 @@ class PyDMDrawingArc(Alarmable, Drawable, Hidable, StyleSheetObject):
 
     startAngle: Optional[float] = None
     spanAngle: Optional[int] = 180
+    transparent_when_filled: ClassVar[bool] = True
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -354,7 +388,7 @@ class PyDMDrawingArc(Alarmable, Drawable, Hidable, StyleSheetObject):
 
 
 @dataclass
-class PyDMDrawingPie(Alarmable, Drawable, Hidable, StyleSheetObject):
+class PyDMDrawingPie(Alarmable, Drawable, Hidable):
     """
     PyDMDrawingPie represents a filled pie/wedge shape that supports XML serialization,
     alarm functionality, and can be hidden.
@@ -364,6 +398,7 @@ class PyDMDrawingPie(Alarmable, Drawable, Hidable, StyleSheetObject):
 
     startAngle: Optional[float] = None
     spanAngle: Optional[int] = 180
+    transparent_when_filled: ClassVar[bool] = True
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -479,6 +514,7 @@ class PyDMPushButtonBase(QPushButton, Alarmable):
     password_protected: Optional[bool] = None
     password: Optional[str] = None
     protected_password: Optional[str] = None
+    alarm_content_style: ClassVar[str] = "background-color"
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -504,8 +540,6 @@ class PyDMPushButtonBase(QPushButton, Alarmable):
             properties.append(Str("password", self.password).to_xml())
         if self.protected_password is not None:
             properties.append(Str("protectedPassword", self.protected_password).to_xml())
-        if isinstance(self.name, str) and self.name.startswith("activeMenuButtonClass"):
-            properties.append(Str("text", "Menu").to_xml())
 
         return properties
 
@@ -572,11 +606,6 @@ class PyDMPushButton(PyDMPushButtonBase):
 
             self.rules.append(RuleArguments("Visible", self.channel, False, show_button, None, None))
             self.rules.append(RuleArguments("Enable", self.channel, False, show_button, None, None))
-            enum_index = 0 if self.is_off_button else 1
-            if self.text is None and self.channel is not None:
-                pv = PV(self.channel, connection_timeout=0.5)
-                if pv and pv.enum_strs and len(list(pv.enum_strs)) >= 2:
-                    self.text = pv.enum_strs[enum_index]
         if self.is_freeze_button is not None and not self.is_freeze_button:
             self.channel = "loc://FROZEN_STATE?type=int&init=0"
             self.rules.append(RuleArguments("Visible", "loc://FROZEN_STATE", False, False, None, None))
@@ -613,14 +642,11 @@ class PyDMPushButton(PyDMPushButtonBase):
             or self.background_color is not None
             or self.flat is True
             or (
-                isinstance(self.name, str)
-                and (
-                    self.name.startswith("activeMenuButtonClass") or self.name.startswith("activeMessageButtonClass")
-                )  # TODO: Eventually remove this whole stylesheet property
-            )
+                isinstance(self.name, str) and self.name.startswith("activeMessageButtonClass")
+            )  # TODO: Eventually remove this whole stylesheet property
         ):
             styles: Dict[str, any] = {}
-            if self.name.startswith("activeMenuButtonClass") or self.name.startswith("activeMessageButtonClass"):
+            if self.name.startswith("activeMessageButtonClass"):
                 styles["border"] = "1px solid black"
             if self.foreground_color is not None:
                 styles["color"] = self.foreground_color
@@ -635,7 +661,7 @@ class PyDMPushButton(PyDMPushButtonBase):
                 styles["background-color"] = "transparent"
             if self.on_color is not None and self.off_color != self.on_color:
                 logging.warning("on and off colors are different, need to modify code")
-            properties.append(StyleSheet(styles).to_xml())
+            properties.append(StyleSheet(styles, self.alarm_content_rules()).to_xml())
         return properties
 
 
@@ -728,8 +754,9 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
         The titles for the display.
     macros : Optional[Union[str, List[str]]]
         Macros used for the display: one JSON string per filename, by position.
-    open_in_new_window : Optional[bool]
-        If True, opens the display in a new window.
+    open_in_new_window : bool
+        If True (the default, as in EDM), opens the display in a new window; if
+        False, a PyDM main window opens it in place of the current display.
     follow_symlinks : Optional[bool]
         If True, follows symbolic links.
     count : ClassVar[int]
@@ -740,7 +767,7 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
     filenames: Optional[str] = None
     titles: Optional[str] = None
     macros: Optional[Union[str, List[str]]] = None
-    open_in_new_window: Optional[bool] = None
+    open_in_new_window: bool = True
     follow_symlinks: Optional[bool] = None
     displayFileName = None
 
@@ -770,8 +797,7 @@ class PyDMRelatedDisplayButton(PyDMPushButtonBase):
                 properties.append(StringList("macros", self.macros).to_xml())
             else:
                 properties.append(Str("macros", self.macros).to_xml())
-        # if self.open_in_new_window is not None:
-        properties.append(Bool("openInNewWindow", True).to_xml())
+        properties.append(Bool("openInNewWindow", self.open_in_new_window).to_xml())
         if self.follow_symlinks is not None:
             properties.append(Bool("followSymlinks", self.follow_symlinks).to_xml())
         if (
@@ -883,6 +909,7 @@ class PyDMEnumComboBox(QComboBox, Alarmable, StyleSheetObject):
 
     tool_tip: Optional[str] = None
     monitor_disp: Optional[bool] = None
+    alarm_content_style: ClassVar[str] = "background-color"
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -1053,6 +1080,7 @@ class PyDMDrawingLine(Legible, Drawable, Alarmable):
     flip_mid_point_arrow: Optional[bool] = None
     arrows: Optional[str] = None
     penColor: Optional[RGBA] = None
+    transparent_when_filled: ClassVar[bool] = True
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -1084,7 +1112,6 @@ class PyDMDrawingLine(Legible, Drawable, Alarmable):
             properties.append(Bool("arrowStartPoint", True).to_xml())
         if self.arrows is not None and (self.arrows == "both" or self.arrows == "from"):
             properties.append(Bool("arrowEndPoint", True).to_xml())
-        properties.append(TransparentBackground().to_xml())
         return properties
 
 
@@ -1150,6 +1177,7 @@ class PyDMDrawingIrregularPolygon(Alarmable, Drawable, Hidable):
     """
 
     points: Optional[List[str]] = None
+    transparent_when_filled: ClassVar[bool] = True
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -1161,13 +1189,6 @@ class PyDMDrawingIrregularPolygon(Alarmable, Drawable, Hidable):
             A list of XML elements representing the PyDMDrawingIrregularPolygon properties.
         """
         properties: List[ET.Element] = super().generate_properties()
-
-        # Always add transparent background for widget itself (not the polygon fill)
-        # This ensures the rectangular widget background doesn't obstruct other widgets
-        # The polygon shape will still be filled via the brush property
-        from pydmconverter.widgets_helpers import TransparentBackground
-
-        properties.append(TransparentBackground().to_xml())
 
         if self.points is not None:
             points_prop = ET.Element("property", attrib={"name": "points", "stdset": "0"})
@@ -1932,7 +1953,15 @@ class PyDMSlider(Alarmable):
         properties: List[ET.Element] = super().generate_properties()
 
         if self.orientation is not None:
-            properties.append(Enum("orientation", f"Qt::{self.orientation.capitalize()}").to_xml())
+            orientation = str(self.orientation).capitalize()
+            if orientation in ("Horizontal", "Vertical"):
+                properties.append(Enum("orientation", f"Qt::{orientation}").to_xml())
+            else:
+                # uic stops loading the whole screen at an unknown Qt enum, so
+                # leave the slider horizontal. EDM's plain slider ignores the tag.
+                logging.warning(
+                    f"Slider {self.name}: orientation {self.orientation!r} is not a Qt orientation; using horizontal"
+                )
         if self.limitsFromDb is not None:
             properties.append(Bool("userDefinedLimits", not self.limitsFromDb).to_xml())
         if not self.showLimitLabels:

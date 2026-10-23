@@ -157,7 +157,7 @@ def in_groups(screen, *boxes):
     return screen[:start] + block + screen[end:]
 
 
-# Only menu mux inside a group, as in lcls/lasr_in20_main_heater.edl (#164).
+# Only menu mux inside a group (#164).
 GROUPED_SCREEN = in_groups(SCREEN, (5, 5, 110, 35))
 NESTED_SCREEN = in_groups(SCREEN, (2, 2, 200, 100), (5, 5, 110, 35))
 MODE_MENU = """\
@@ -217,7 +217,7 @@ LABEL = textwrap.dedent(
     """
 )
 
-# A menu mux like misc/thyratronRange.edl, whose items name different macros:
+# A menu mux whose items name different macros:
 # "LI24" sets visibleLI24 through symbol1 and visibleLI20 through symbol2,
 # "LI21" leaves visibleLI24's value out, and "?" sets nothing.
 PER_ITEM_SCREEN = (
@@ -355,6 +355,29 @@ def test_generated_screen_compiles_and_names_its_ui_without_a_path(menumux_scree
     assert "pydmconverter" not in code
 
 
+def test_failed_conversion_leaves_no_menu_screen(tmp_path, monkeypatch):
+    """The menu screen embeds the .ui, so it is written only after the .ui: a
+    conversion that fails once the widgets are built leaves neither file."""
+    import pydmconverter.edm.converter as converter
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("late failure")
+
+    source = tmp_path / "screen.edl"
+    source.write_text(SCREEN)
+    monkeypatch.chdir(tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(converter, "resolve_window_macros", fail)
+        with pytest.raises(RuntimeError, match="late failure"):
+            convert(str(source), str(tmp_path / "screen.ui"))
+    assert not (tmp_path / "screen.py").exists()
+    assert not (tmp_path / "screen.ui").exists()
+
+    convert(str(source), str(tmp_path / "screen.ui"))
+    assert (tmp_path / "screen.ui").is_file()
+    assert "self.embedded.filename = 'screen.ui'" in (tmp_path / "screen.py").read_text()
+
+
 def test_menu_without_tags_is_labelled_by_its_values(tmp_path, monkeypatch):
     source = tmp_path / "untagged.edl"
     source.write_text(SCREEN.replace('symbolTag {\n  0 "Off"\n  1 "On"\n}\n', ""))
@@ -392,13 +415,16 @@ def test_menu_change_reinitialises_local_variables(menumux_screen, qtbot, monkey
     # Macros the screen was opened with reach the embedded .ui too.
     assert screen.embedded.parsed_macros()["START"] == "1"
 
-    # initialState reads like strtol and falls back to the first item.
+    # initialState reads like strtol, falls back to the first item and, as
+    # in EDM, is clamped to the items.
     def initial(state, count=5):
         return screen.initial_index(state, count)
 
     assert initial("${START}+1") == 1
     assert initial("3") == 3
-    assert initial("9") == 0
+    assert initial("+2") == 2
+    assert initial("9") == 4
+    assert initial("-1") == 0
     assert initial("${MISSING}") == 0
 
 
@@ -548,6 +574,29 @@ def test_first_menu_to_set_a_macro_wins(menumux_screen, qtbot):
 
     # With neither menu setting anything, the macros stay as they were.
     second.setCurrentIndex(1)
+    assert macros_and_label(screen) == ({"sector": "LI30"}, "LI30 ${visibleLI20} ${visibleLI24}")
+
+
+# TWO_MENU_SCREEN with the first menu's initialState past its items, like
+# initialState "16" on 16 items (the last "NONE").
+PAST_THE_END_SCREEN = TWO_MENU_SCREEN.replace('initialState "0"', 'initialState "4"', 1)
+
+
+@pytest.mark.parametrize("menumux_screen", [PAST_THE_END_SCREEN], ids=["past_the_end"], indirect=True)
+def test_menu_past_its_items_opens_on_the_last(menumux_screen, qtbot):
+    pytest.importorskip("pydm")
+    from pydm.display import load_file
+    from qtpy.QtWidgets import QComboBox
+
+    screen = load_file(str(menumux_screen), target=None)
+    qtbot.addWidget(screen)
+    screen.show()
+    first, second = screen.findChildren(QComboBox)
+    qtbot.waitUntil(lambda: screen.embedded.embedded_widget is not None, timeout=3000)
+
+    # EDM clamps the index to the items, so the first menu sets the macros of
+    # its last item "?": none, and the second menu's sector applies.
+    assert first.currentIndex() == 3
     assert macros_and_label(screen) == ({"sector": "LI30"}, "LI30 ${visibleLI20} ${visibleLI24}")
 
 
@@ -859,7 +908,7 @@ WINDOW_SCREEN = textwrap.dedent(
     h 160
     endScreenProperties
 
-    # (Menu Mux) switching the embedded window below, as in b34/profile_b34.edl
+    # (Menu Mux) switching the embedded window below
     object menuMuxClass
     beginObjectProperties
     major 4
@@ -955,7 +1004,7 @@ def test_menu_switches_the_embedded_window_it_writes(tmp_path, monkeypatch, qtbo
     qtbot.waitUntil(lambda: combo.currentIndex() == 1 and shown() == ["panelOn.ui"], timeout=3000)
 
 
-# (Menu Mux) a camera menu setting the embedded .ui's macros, as in b34/profile_b34.edl
+# (Menu Mux) a camera menu setting the embedded .ui's macros
 CAMERA_MENU = textwrap.dedent(
     r"""
     object menuMuxClass

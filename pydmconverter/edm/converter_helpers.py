@@ -1,7 +1,16 @@
 import dataclasses
 import re
-from typing import Optional, List, Tuple
-from pydmconverter.edm.parser import EDMObject, EDMGroup, EDMFileParser, block_items, block_list
+import xml.etree.ElementTree as ET
+from typing import Any, Optional, List, Tuple
+from urllib.parse import parse_qs
+from pydmconverter.edm.parser import (
+    EDMObject,
+    EDMGroup,
+    EDMFileParser,
+    block_items,
+    block_list,
+    closing_display_indices,
+)
 from pydmconverter.widgets import (
     PyDMDrawingRectangle,
     PyDMDrawingEllipse,
@@ -17,6 +26,7 @@ from pydmconverter.widgets import (
     PyDMEmbeddedDisplay,
     QPushButton,
     PyDMEnumButton,
+    PyDMEnumComboBox,
     QTabWidget,
     QWidget,
     QTableWidget,
@@ -28,15 +38,31 @@ from pydmconverter.widgets import (
     PyDMSlider,
     PyDMWaveformTable,
     PyDMAnalogIndicator,
+    filename_rule,
 )
+from pydmconverter.widgets_helpers import Alarmable
 from pydmconverter.edm.parser_helpers import (
+    SearchPaths,
     convert_color_property_to_qcolor,
     search_color_list,
     parse_colors_list,
     parse_edm_macros,
     loc_str_init,
+    vis_range,
 )
-from pydmconverter.edm.menumux import generate_menumux_file, initial_state, menu_item_count, menu_items, menu_macros
+from pydmconverter.edm.menumux import initial_state, menu_item_count, menu_items, menu_macros
+from pydmconverter.edm.display_roots import map_display_roots, resolve_display_roots
+from pydmconverter.edm.window_macros import WINDOW_MARKER
+from pydmconverter.edm.edm_qt import (
+    EDM_ALARM_BORDER_CLASSES,
+    EDM_ALARM_FLAGS,
+    EDM_ALARM_PROPS,
+    EDM_DATA_PV_ATTRS,
+    EDM_TEXT_VALUE_CLASSES,
+    XY_GRAPH_UNMAPPED_PVS,
+    channel_roles,
+    names_the_channel,
+)
 from pydmconverter.exceptions import AttributeConversionError
 import ast
 import logging
@@ -44,6 +70,7 @@ import math
 import os
 import copy
 import json
+from urllib.parse import unquote
 
 EDM_TO_PYDM_WIDGETS = {  # missing PyDMFrame,  QComboBox
     # Graphics widgets
@@ -68,9 +95,9 @@ EDM_TO_PYDM_WIDGETS = {  # missing PyDMFrame,  QComboBox
     # "radio_box": PyDMRadioButtonGroup,
     "related_display_button": PyDMRelatedDisplayButton,
     "shell_command": PyDMShellCommand,
-    # "activemessagebuttonclass": PyDMEnumComboBox,  # and more: activeMenuButtonClass, activeButtonClass
     # "": PyDMEnumButton
-    "activemenubuttonclass": PyDMPushButton,  # "activemenubuttonclass": PyDMEnumComboBox,
+    # EDM's menu button pops up its PV's states to choose from (menu_button.cc).
+    "activemenubuttonclass": PyDMEnumComboBox,
     "activemessagebuttonclass": PyDMPushButton,
     "activextextdspclass": PyDMLineEdit,
     "activepipclass": PyDMEmbeddedDisplay,
@@ -131,23 +158,15 @@ EDM_TO_PYDM_ATTRIBUTES = {
     "enabled": "enabled",
     "precision": "precision",
     "showUnits": "show_units",
-    "alarmPv": "channel",
-    "controlPv": "channel",
-    "indicatorPv": "channel",
-    "filePv": "channel",
+    # PV tags that name a widget's channel are routed by apply_channel_roles.
     "visPv": "visPv",
-    "colorPv": "channel",
-    "readPv": "channel",
-    "nullPv": "channel",
-    "pv": "channel",
     "visInvert": "visInvert",
-    "value": "text",
+    "value": "text",  # static text only (EDM_TEXT_VALUE_CLASSES)
     "fill": "brushFill",
     "fillColor": "brushColor",
     "autoSize": "autoSize",
     "lineColor": "penColor",
-    # Graphics attributes
-    "lineWidth": "line_width",
+    # Graphics attributes (lineWidth: apply_widget_post_processing)
     "lineStyle": "penStyle",
     "radius": "radius",
     "color": "color",
@@ -199,11 +218,7 @@ EDM_TO_PYDM_ATTRIBUTES = {
     "gridColor": "axisColor",
     "yAxisSrc": "yAxisSrc",
     "xAxisSrc": "xAxisSrc",
-    # Alarm sensitivity
-    "alarmSensitiveContent": "alarmSensitiveContent",
-    "alarmSensitiveBorder": "alarmSensitiveBorder",
-    "fgAlarm": "alarmSensitiveContent",
-    "lineAlarm": "alarmSensitiveContent",
+    # Alarm flags are mapped per class by apply_alarm_flags.
     # Push Button attributes
     "pressValue": "press_value",
     "releaseValue": "release_value",
@@ -245,7 +260,55 @@ TAB_PAGES = "_tab_pages"
 # Group property: its visibility rule starts true rather than false.
 STARTS_VISIBLE = "_starts_visible"
 
+# Related display property: it took an overlapping static text as its label
+# (set by should_delete_overlapping).
+LABEL_FROM_TEXT = "_label_from_text"
+
 LOC_NAME_PATTERN = re.compile(r"loc://([^?&\s\"',]+)")
+
+# A channel address as PyDM splits it (pydm/utilities/remove_protocol.py
+# parsed_address): protocol, netloc, path, query. The local plugin names a
+# variable by its netloc.
+PYDM_ADDRESS_PATTERN = re.compile(r"(.*?)://([^/?]*)(?:(/[^?]*)?(?:\?(.*))?)?")
+
+# The loc:// types PyDM converts init with (local_plugin.py convert_value),
+# arrays aside.
+LOC_TYPES = {"int": int, "float": float, "str": str, "bool": bool}
+
+# The value of a loc:// variable that is only known once PyDM loads the screen.
+UNKNOWN_VALUE = object()
+
+# PyDM widgets the converter writes that have no channel Qt property, and no
+# rules property: a .ui sets these on them as dynamic properties, which PyDM
+# never connects. Qt's own classes have neither.
+NO_CHANNEL_CLASSES = {"PyDMEmbeddedDisplay", "PyDMTabWidget", "PyDMWaveformPlot"}
+NO_RULES_CLASSES = {"PyDMTabWidget"}
+
+# The nodes of the rule expressions MultiRule writes: ch[i], numbers, None,
+# float(), comparisons, and, or, not. _rule_nodes_allowed restricts some further.
+RULE_EXPRESSION_NODES = (
+    ast.Expression,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.UnaryOp,
+    ast.Not,
+    ast.USub,
+    ast.Compare,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.Is,
+    ast.IsNot,
+    ast.Call,
+    ast.Subscript,
+    ast.Name,
+    ast.Load,
+    ast.Constant,
+)
 
 COLOR_ATTRIBUTES: set = {
     "fgColor",
@@ -306,6 +369,16 @@ def transform_nested_widget(
     return int(relative_x), int(relative_y), int(child_width), int(child_height)
 
 
+EDM_CLOSED_DRAWINGS = ("activerectangleclass", "activecircleclass", "activearcclass")
+
+
+def edm_line_width(obj: EDMObject) -> int:
+    """The width EDM draws a rectangle, circle or arc outline with: its lineWidth, 1 by
+    default (rectangle_obj.cc, circle_obj.cc, arc_obj.cc). Width 0 is X11's thinnest
+    line, which is also one pixel wide."""
+    return max(1, int(obj.properties.get("lineWidth", 1)))
+
+
 def _has_fill_properties(obj: EDMObject) -> tuple:
     """Return (has_fill, has_fill_color) for an EDM object."""
     has_fill = obj.properties.get("fill") is True or "fill" in obj.properties
@@ -337,6 +410,15 @@ def _compute_geometry(obj, parent_pydm_group, container_height, scale, offset_x,
             parent_pydm_group.height,
             scale=scale,
         )
+
+
+def _set_header_geometry(widget, obj, parent_pydm_group, container_height, scale, offset_x, offset_y) -> None:
+    """Place ``widget`` at the object's own x/y/w/h (see :func:`_compute_geometry`), at least 1x1."""
+    x, y, width, height = _compute_geometry(obj, parent_pydm_group, container_height, scale, offset_x, offset_y)
+    widget.x = int(x)
+    widget.y = int(y)
+    widget.width = max(1, int(width))
+    widget.height = max(1, int(height))
 
 
 def get_polyline_widget_type(obj: EDMObject) -> type:
@@ -494,7 +576,8 @@ def resolve_widget_type(obj: EDMObject):
         return None
 
     if name == "activechoicebuttonclass" and TAB_PAGES not in obj.properties:
-        channel = search_for_edm_attr(obj, "channel")
+        attr = channel_attr(obj)
+        channel = obj.properties[attr] if attr else None
         if not channel:
             logger.warning(f"Could not find channel in object: {obj.name}")
         else:
@@ -503,6 +586,108 @@ def resolve_widget_type(obj: EDMObject):
             obj.properties["hide_on_disconnect_channel"] = channel
 
     return widget_type
+
+
+def channel_attr(obj: EDMObject) -> Optional[str]:
+    """The tag of the PV the object's widget binds as its channel, or None.
+
+    That is the class's data PV (edm_qt.EDM_CHANNEL_ROLES). PyDM colours a
+    widget for alarms only from its own channel, so a class that shows no PV
+    (drawings, static text) binds its alarmPv instead.
+    """
+    roles = channel_roles(obj.name.lower())
+    attr = roles.data_attr(obj.properties)
+    if attr is None and roles.alarm and obj.properties.get(roles.alarm):
+        attr = roles.alarm
+    return attr
+
+
+def object_vis_range(name: str, properties: dict) -> Optional[Tuple[float, float]]:
+    """The (visMin, visMax) an EDM object or group shows between, read with
+    EDM's atof() as the IR reads them (parser_helpers.vis_range).
+
+    None when a limit can't be evaluated here, such as one that starts with a
+    macro: the caller drops the visibility rule, so the widget always shows, as
+    in the IR, and a warning says why. PyDM would substitute the macro when it
+    loads the screen, but only as text in the rule expression, which has no
+    atof(): a limit that names a PV would not parse, and the widget would stay
+    hidden.
+    """
+    warnings: List[str] = []
+    limits = vis_range(properties, warnings)
+    for warning in warnings:
+        logger.warning(f"{name}: {warning}")
+    return limits
+
+
+def apply_channel_roles(widget, obj: EDMObject) -> None:
+    """Bind the widget's channel to the PV channel_attr names, and warn about
+    each of the object's other PVs, which a .ui has no place for: a PyDM
+    widget reads and writes its one channel, with no readback and no colour
+    rules (drawings aside, which the converter doesn't write yet).
+    """
+    roles = channel_roles(obj.name.lower())
+    props = obj.properties
+    attr = channel_attr(obj)
+    if attr is not None:
+        widget.channel = props[attr]
+        if attr == roles.alarm and isinstance(widget, PyDMLabel):
+            # The label keeps its text and only takes the alarm PV's severity.
+            widget.display_label_text = True
+
+    readback = roles.readback_attr(props)
+    if readback is not None:
+        # A readback naming the channel's PV itself loses nothing.
+        if not names_the_channel(props[readback], props[attr]):
+            logger.warning(
+                f"{obj.name}: {readback} {props[readback]} is a readback, which PyDM widgets lack; "
+                f"the widget shows and writes {attr} {props[attr]}"
+            )
+    elif attr is not None and attr == roles.readback:
+        logger.warning(f"{obj.name}: {attr} {props[attr]} is its only PV; PyDM writes it, which EDM never does")
+    color = roles.color_attr(props)
+    if color is not None and color != attr:
+        logger.warning(f"{obj.name}: {color} {props[color]} picks rule colours, which the .ui doesn't carry")
+    condition = props.get("nullCondition") or "nullEqCtl"
+    if roles.null and props.get(roles.null) and condition != "disabled":
+        logger.warning(
+            f"{obj.name}: {roles.null} {props[roles.null]} switches the text to nullColor ({condition}), "
+            "which the .ui doesn't carry"
+        )
+    for other in EDM_DATA_PV_ATTRS:
+        if other not in (attr, readback) and props.get(other):
+            logger.warning(f"{obj.name}: {other} {props[other]} has no place in the .ui; dropped")
+    if obj.name.lower() in ("xygraphclass", "mzxygraphclass"):
+        for tag, effect in XY_GRAPH_UNMAPPED_PVS.items():
+            pvs = [pv for _, pv in block_items(props.get(tag)) if pv.strip()]
+            if pvs:
+                logger.warning(f"{obj.name}: {tag} {', '.join(pvs)} ({effect}) has no place in the .ui; dropped")
+
+
+def apply_alarm_flags(widget, obj: EDMObject) -> None:
+    """Make the widget follow its channel's alarm severity only where the
+    object's alarm flags say EDM does (edm_qt.EDM_ALARM_PROPS); an object
+    without them never changes colour for alarms. A flag the table doesn't map
+    for the class (a slider's bgAlarm, a bar's indicatorAlarm, a text's bgAlarm)
+    is dropped with a warning.
+    """
+    if not isinstance(widget, Alarmable):
+        return
+    name = obj.name.lower()
+    props = obj.properties
+    flags = EDM_ALARM_PROPS.get(name, {})
+    # Only a filled shape has a fill to colour: PyDM would fill an unfilled one,
+    # and colour a polyline's arrowheads.
+    filled = bool(props.get("fill")) and not isinstance(widget, PyDMDrawingLine)
+    on = {qt_prop for flag, qt_prop in flags.items() if props.get(flag) and (flag != "fillAlarm" or filled)}
+    if name in EDM_ALARM_BORDER_CLASSES and props.get("useAlarmBorder") and "alarmSensitiveContent" in on:
+        on = {"alarmSensitiveBorder"}
+    widget.alarm_sensitive_content = "alarmSensitiveContent" in on
+    widget.alarm_sensitive_border = "alarmSensitiveBorder" in on
+    # Against the table, not what is on: a fillAlarm without a fill loses nothing EDM draws.
+    for flag in EDM_ALARM_FLAGS:
+        if props.get(flag) and flag not in flags:
+            logger.warning(f"{obj.name}: {flag} has no place in the .ui; static colours kept")
 
 
 def convert_attribute_value(edm_attr, value, widget, obj, color_list_dict):
@@ -572,6 +757,8 @@ def convert_attribute_value(edm_attr, value, widget, obj, color_list_dict):
             logger.warning(f"Could not convert color {value}, skipping")
             return None
     elif edm_attr == "value":
+        if obj.name.lower() not in EDM_TEXT_VALUE_CLASSES:
+            return None
         value = get_string_value(value)
     elif edm_attr in COLOR_ATTRIBUTES:
         value = convert_color_property_to_qcolor(value, color_data=color_list_dict)
@@ -628,7 +815,14 @@ def apply_widget_post_processing(
         if "xPoints" in obj.properties and "yPoints" in obj.properties:
             x_points = obj.properties["xPoints"]
             y_points = obj.properties["yPoints"]
-            abs_pts = [(int(float(x) * scale), int(float(y) * scale)) for x, y in zip(x_points, y_points)]
+            try:
+                abs_pts = [(int(float(x) * scale), int(float(y) * scale)) for x, y in zip(x_points, y_points)]
+            except (TypeError, ValueError) as e:
+                # A point that is not a number, e.g. a CVS conflict marker left in the
+                # block: keep the header geometry, as the IR target does (ir_adapter._parse_line_points).
+                logger.warning(f"{obj.name} at ({obj.x}, {obj.y}) has malformed points ({e}); using its x/y/w/h")
+                _set_header_geometry(widget, obj, parent_pydm_group, container_height, scale, offset_x, offset_y)
+                return
             pen = int(obj.properties.get("lineWidth", 1))
 
             arrow_size = 0
@@ -656,21 +850,18 @@ def apply_widget_post_processing(
                     widget.brushFill = True
                     logger.info("Setting default white fill color for IrregularPolygon (no fillColor specified)")
 
-                widget.alarm_sensitive_content = True
-                logger.info("Enabled alarm_sensitive_content for IrregularPolygon to ensure fill is visible")
-
-            widget.x = int(geom["x"] + offset_x)
-            widget.y = int(geom["y"] + offset_y)
+            # PyDM draws the points offset by the pen (PyDMDrawing.get_bounds), so the widget
+            # moves back by the pen to put them on EDM's points. A 0 width pen has no border
+            # in PyDM and no offset.
+            border = pen if pen > 0 else 0
+            widget.x = int(geom["x"] + offset_x) - border
+            widget.y = int(geom["y"] + offset_y) - border
             widget.width = int(geom["width"])
             widget.height = int(geom["height"])
     elif not (
         obj.name.lower() == "activelineclass" and isinstance(widget, (PyDMDrawingPolyline, PyDMDrawingIrregularPolygon))
     ):
-        x, y, width, height = _compute_geometry(obj, parent_pydm_group, container_height, scale, offset_x, offset_y)
-        widget.x = int(x)
-        widget.y = int(y)
-        widget.width = max(1, int(width))
-        widget.height = max(1, int(height))
+        _set_header_geometry(widget, obj, parent_pydm_group, container_height, scale, offset_x, offset_y)
 
     # PushButton off/on handling. Labels that differ only in their padding
     # ("Cancel " / "Cancel") get no separate off button.
@@ -694,7 +885,9 @@ def apply_widget_post_processing(
     if isinstance(widget, PyDMEmbeddedDisplay) and obj.name.lower() == "activepipclass":
         if not is_menu_pip(obj):
             # EDM (pip.cc) opens a displayFileName entry only from a menu window.
-            widget.filename = pip_source_file(obj)
+            widget.filename, file_channel = pip_source_file(obj)
+            if file_channel:
+                widget.extra_rules.append(filename_rule(file_channel))
             logger.info(f"Set PyDMEmbeddedDisplay filename to: {widget.filename}")
         elif "displayFileName" in obj.properties and obj.properties["displayFileName"]:
             display_filenames = obj.properties["displayFileName"]
@@ -715,6 +908,23 @@ def apply_widget_post_processing(
             # A menu window opens only its displayFileName entries (pip.cc), never its file.
             widget.filename = None
 
+    # Related display that closes its parent
+    if isinstance(widget, PyDMRelatedDisplayButton):
+        # EDM (related_display.cc popupDisplay) opens the display in a new window and, for
+        # an entry with closeAction set, then closes the parent (from inside an embedded
+        # display, its top-level window). PyDM's nearest match is opening in place: with
+        # openInNewWindow false the PyDM main window swaps to the new display and keeps the
+        # parent in its back history. The property is per button, so every entry must close.
+        files = [index for index, name in block_items(obj.properties.get("displayFileName")) if name.strip()]
+        closing = closing_display_indices(obj.properties)
+        if files and all(index in closing for index in files):
+            widget.open_in_new_window = False
+        elif closing:
+            logger.info(
+                f"Related display closes its parent for only some entries ({sorted(closing)} of {files}); "
+                "opening all in a new window"
+            )
+
     # Freeze button handling
     if obj.name.lower() == "activefreezebuttonclass":
         freeze_button = create_freeze_button(widget)
@@ -722,28 +932,34 @@ def apply_widget_post_processing(
 
     # Multi-slider handling
     if obj.name.lower() == "mmvclass":
+        widget.orientation = mmv_orientation(obj)
         generated_sliders = create_multi_sliders(widget, obj)
         pydm_widgets.extend(generated_sliders)
 
-    # Drawing shape dimension padding
+    # Drawing shape dimension padding. PyDM draws the points offset by the pen
+    # (PyDMDrawing.get_bounds; the widget starts a pen before the first point) and the
+    # stroke reaches pen/2 past the last, so each axis needs span + 1.5 * pen;
+    # geom_and_local_points sized the widget span + pen, so add a pen.
+    # Under alarm the pen keeps its width (Drawable.style_sheet), so no more is needed.
     if isinstance(widget, (PyDMDrawingLine, PyDMDrawingPolyline, PyDMDrawingIrregularPolygon)):
         pad = widget.penWidth or 1
-
-        if isinstance(widget, PyDMDrawingIrregularPolygon):
-            alarm_border_pad = 4 if hasattr(widget, "alarm_sensitive_border") and widget.alarm_sensitive_border else 0
-            pad = pad + alarm_border_pad
-
         min_dim = max(pad * 2, 3)
+        widget.width = max(int(widget.width) + pad, min_dim)
+        widget.height = max(int(widget.height) + pad, min_dim)
 
-        if widget.width < min_dim:
-            widget.width = min_dim
-        else:
-            widget.width = int(widget.width) + pad
-
-        if widget.height < min_dim:
-            widget.height = min_dim
-        else:
-            widget.height = int(widget.height) + pad
+    # Rectangle, circle and arc outlines. EDM centres the pen on the object's rect
+    # (XDrawRectangle, XDrawArc); PyDM insets the shape by the pen width
+    # (PyDMDrawing.get_bounds), so the widget grows by the pen on every side to put the
+    # shape back on EDM's rect. The width is always written: PyDM's construction-time
+    # polish otherwise leaves the 2 px of its alarm-border stylesheet rule.
+    if obj.name.lower() in EDM_CLOSED_DRAWINGS:
+        pen = edm_line_width(obj)
+        widget.penWidth = pen
+        # With no pen style written PyDM draws no outline and insets nothing.
+        if widget.penColor is not None or widget.penStyle is not None:
+            x, y, width, height = _compute_geometry(obj, parent_pydm_group, container_height, scale, offset_x, offset_y)
+            widget.x, widget.y = int(x) - pen, int(y) - pen
+            widget.width, widget.height = int(width) + 2 * pen, int(height) + 2 * pen
 
     # Text widget padding — Qt renders fonts slightly wider than EDM,
     # so add a small width buffer to prevent text clipping and button text wrapping.
@@ -753,12 +969,6 @@ def apply_widget_post_processing(
     if isinstance(widget, (PyDMLabel, PyDMLineEdit)):
         widget.width = max(widget.width, 20)
         widget.height = max(widget.height, 14)
-
-    # Drawing shape alarm sensitivity
-    if isinstance(widget, (PyDMDrawingArc, PyDMDrawingPie, PyDMDrawingRectangle, PyDMDrawingEllipse)):
-        if hasattr(widget, "brushColor") and widget.brushColor is not None:
-            widget.alarm_sensitive_content = True
-            logger.info(f"Enabled alarm_sensitive_content for {type(widget).__name__} to ensure fill is visible")
 
     # Auto-size
     if obj.properties.get("autoSize", False) and hasattr(widget, "autoSize"):
@@ -838,12 +1048,14 @@ def traverse_group(
             logger.debug("Skipped pydm_group")
 
             vis_invert = bool(obj.properties.get("visInvert", False))
-            if "visPv" in obj.properties and "visMin" in obj.properties and "visMax" in obj.properties:
-                curr_vispv = [(obj.properties["visPv"], obj.properties["visMin"], obj.properties["visMax"], vis_invert)]
+            limits = None
+            if "visPv" in obj.properties:
+                limits = object_vis_range(f"Group at ({obj.x}, {obj.y})", obj.properties)
+            if limits is not None:
+                # EDM shows the group while visMin <= value < visMax.
+                curr_vispv = [(obj.properties["visPv"], *limits, vis_invert)]
                 if obj.properties.get(STARTS_VISIBLE):
                     curr_vispv = [curr_vispv[0] + (True,)]
-            elif "visPv" in obj.properties:
-                curr_vispv = [(obj.properties["visPv"], None, None, vis_invert)]
             else:
                 curr_vispv = []
 
@@ -856,6 +1068,10 @@ def traverse_group(
                         False,
                     )
                 ]
+                if "symbolOtherRanges" in obj.properties:
+                    # State 0 also shows while no other state's range holds the value.
+                    other_ranges = tuple(tuple(other) for other in obj.properties["symbolOtherRanges"])
+                    symbol_vispv = [symbol_vispv[0] + (False, other_ranges)]
             else:
                 symbol_vispv = []
 
@@ -929,6 +1145,17 @@ def traverse_group(
                     logger.info(f"Set {pydm_attr} to {value} for {widget.name}")
                 except Exception as e:
                     raise AttributeConversionError(edm_attr, value, widget.name, cause=e) from e
+            # The visibility range as EDM reads visMin/visMax; a limit it can't read here drops the rule.
+            if getattr(widget, "visPv", None) is not None:
+                limits = object_vis_range(obj.name, obj.properties)
+                if limits is None:
+                    widget.visPv = None
+                else:
+                    widget.visMin, widget.visMax = limits
+            # Before post-processing: on/off button variants copy the channel and key their rules on it,
+            # and the alarm flags with it.
+            apply_channel_roles(widget, obj)
+            apply_alarm_flags(widget, obj)
 
             # 4. Post-processing (geometry, button variants, dimension padding, etc.)
             apply_widget_post_processing(
@@ -957,7 +1184,9 @@ def traverse_group(
     return pydm_widgets, menu_mux_buttons
 
 
-def convert_edm_to_pydm_widgets(parser: EDMFileParser, site=None, color_list_file: str | None = None):
+def convert_edm_to_pydm_widgets(
+    parser: EDMFileParser, site=None, color_list_file: str | None = None, display_roots: SearchPaths = None
+):
     """
     Converts an EDMFileParser object into a collection of PyDM widget instances.
 
@@ -969,15 +1198,24 @@ def convert_edm_to_pydm_widgets(parser: EDMFileParser, site=None, color_list_fil
         Explicit path to an EDM ``colors.list`` palette used to resolve "index N"
         colors. Falls back to ``EDMCOLORFILE``, ``$EDMFILES/colors.list``, then
         ``/etc/edm/colors.list`` when omitted.
+    display_roots : str | Sequence[str], optional
+        Absolute directories whose display names become root-relative (see
+        pydmconverter.edm.display_roots). Falls back to ``PYDMCONVERTER_DISPLAY_ROOTS``
+        when omitted.
 
     Returns
     -------
     Tuple[List, set]
-        A tuple of (pydm_widgets, used_classes).
+        A tuple of (pydm_widgets, used_classes). The screen's menu muxes and the
+        loc:// declarations their menu screen shares with the .ui are left on the
+        parser (``menu_mux_buttons``, ``menu_loc_declarations``) for convert() to
+        write once the .ui is written.
     """
     from pydmconverter.sites import get_skip_widgets
 
     skip_widgets = get_skip_widgets(site)
+    # First, so the tab pages and stacked displays built from a menu window copy mapped names.
+    map_display_roots(parser.ui, resolve_display_roots(display_roots))
 
     used_classes = set()
     color_list_filepath = search_color_list(color_list_file)
@@ -1004,8 +1242,8 @@ def convert_edm_to_pydm_widgets(parser: EDMFileParser, site=None, color_list_fil
 
     pydm_widgets = handle_button_polygon_overlaps(pydm_widgets)
 
-    if menu_mux_buttons:
-        generate_menumux_file(menu_mux_buttons, parser.output_file_path, loc_declarations(parser.ui))
+    parser.menu_mux_buttons = menu_mux_buttons
+    parser.menu_loc_declarations = loc_declarations(parser.ui) if menu_mux_buttons else {}
     return pydm_widgets, used_classes
 
 
@@ -1028,10 +1266,12 @@ def should_delete_overlapping(
                 and widget.height == curr_obj.height
             )
             or (percentage_overlapping != 100 and calculate_widget_overlap(curr_obj, widget) > percentage_overlapping)
-            and "value" not in widget.properties
+            and LABEL_FROM_TEXT not in widget.properties
             and "value" in curr_obj.properties
         ):
-            widget.properties["value"] = curr_obj.properties["value"]
+            # The text becomes the button's label.
+            widget.properties["buttonLabel"] = get_string_value(curr_obj.properties["value"])
+            widget.properties[LABEL_FROM_TEXT] = True
             return True
     return False
 
@@ -1142,11 +1382,36 @@ def create_freeze_button(widget: PyDMPushButton):
     )
 
 
+# mmvClass orientation values: ORIENT_HT, ORIENT_VL, ORIENT_HB and ORIENT_VR (mmover.h).
+MMV_ORIENTATIONS = {"0": "horizontal", "1": "vertical", "2": "horizontal", "3": "vertical"}
+
+
+def mmv_orientation(obj: EDMObject) -> Optional[str]:
+    """A multi-mover's direction, "horizontal" or "vertical".
+
+    EDM reads it from the numeric orientation (mmover.cc createFromFile).
+    orientStr is the editor's name for the same choice, used here only when
+    orientation is missing. None leaves the slider horizontal, Qt's default.
+    """
+    orientation = MMV_ORIENTATIONS.get(str(obj.properties.get("orientation", "")).strip())
+    if orientation is not None:
+        return orientation
+    orient_str = str(obj.properties.get("orientStr", "")).lower()
+    if orient_str.startswith("horiz"):
+        return "horizontal"
+    if orient_str.startswith("vert"):
+        return "vertical"
+    return None
+
+
 def create_multi_sliders(widget: PyDMSlider, object: EDMObject):
     """
     Given a ActiveSlider converted from a mmvclass, create stacked sliders to show each slider indicator.
-    Modifies the height and channel of the current slider
+    Modifies the size and channel of the current slider. The sliders share the
+    mover's thickness, so each keeps EDM's full track length: horizontal ones
+    stack top to bottom, vertical ones sit side by side.
     """
+    vertical = widget.orientation == "vertical"
     i = 1
     prevColor = None
     ctrl_attributes = []
@@ -1160,13 +1425,19 @@ def create_multi_sliders(widget: PyDMSlider, object: EDMObject):
         prevColor = currColor
         i += 1
     if ctrl_attributes:
-        widget.height = widget.height // len(ctrl_attributes)
+        if vertical:
+            widget.width = widget.width // len(ctrl_attributes)
+        else:
+            widget.height = widget.height // len(ctrl_attributes)
         widget.channel = ctrl_attributes[0][0]
         widget.indicatorColor = ctrl_attributes[0][1]
         for j in range(1, len(ctrl_attributes)):
             curr_slider = copy.deepcopy(widget)
             curr_slider.name = widget.name + f"_{j}"
-            curr_slider.y = curr_slider.y + curr_slider.height * j
+            if vertical:
+                curr_slider.x = curr_slider.x + curr_slider.width * j
+            else:
+                curr_slider.y = curr_slider.y + curr_slider.height * j
             curr_slider.channel = ctrl_attributes[j][0]
             curr_slider.indicatorColor = ctrl_attributes[j][1]
             logger.info(f"Created multi-slider: {curr_slider.name} based on {widget.name}")
@@ -1218,12 +1489,13 @@ def _loc_names(obj: EDMObject) -> set:
 
 def _loc_enum_strings(url: str) -> List[str]:
     """States of an enum loc:// URL. parser_helpers.loc_conversion writes them
-    last, as a Python list literal (the form PyDM's local plugin reads)."""
+    last, as a Python list literal (the form PyDM's local plugin reads), with
+    "%", "&" and "+" percent-encoded."""
     _, found, literal = url.partition("&enum_string=")
     if not found:
         return []
     try:
-        return [str(state) for state in ast.literal_eval(literal)]
+        return [str(state) for state in ast.literal_eval(unquote(literal))]
     except (ValueError, SyntaxError):
         return []
 
@@ -1248,6 +1520,181 @@ def loc_declarations(root: EDMGroup) -> dict:
 def _loc_init(url: str) -> int:
     match = re.search(r"[?&]init=(-?\d+)", url)
     return int(match.group(1)) if match else 0
+
+
+def _loc_variable(address) -> Tuple[Optional[str], Any]:
+    """(name, initial value) of a loc:// address, read as PyDM's local plugin
+    reads it (local_plugin.py UrlToPython, convert_value).
+
+    The name is None for any other address. Only an address with both type and
+    init configures the variable: the value is None for one without, and
+    UNKNOWN_VALUE when it is only known once PyDM loads the screen (a macro, an
+    array or other type, an init its type rejects).
+    """
+    match = PYDM_ADDRESS_PATTERN.match(address) if isinstance(address, str) else None
+    if match is None or match.group(1) != "loc" or not match.group(2):
+        return None, None
+    name = match.group(2)
+    config = parse_qs(match.group(4) or "")
+    if "type" not in config or "init" not in config:
+        return name, None
+    value_type, init = config["type"][0], config["init"][0]
+    convert = LOC_TYPES.get(value_type)
+    has_macro = "$" in value_type + init or WINDOW_MARKER in value_type + init
+    if convert is None or has_macro or config.keys() & {"dtype", "copy", "order", "subok", "ndmin"}:
+        return name, UNKNOWN_VALUE
+    try:
+        # bool("0") is True: PyDM converts the text, not the number.
+        return name, convert(init)
+    except ValueError:
+        return name, UNKNOWN_VALUE
+
+
+def _rule_nodes_allowed(tree: ast.AST) -> bool:
+    """Whether a parsed rule expression is built only from what MultiRule writes."""
+    for node in ast.walk(tree):
+        if not isinstance(node, RULE_EXPRESSION_NODES):
+            return False
+        if isinstance(node, ast.Name) and node.id not in ("ch", "float"):
+            return False
+        if isinstance(node, ast.Call):
+            if not (isinstance(node.func, ast.Name) and node.func.id == "float"):
+                return False
+            if len(node.args) != 1 or node.keywords:
+                return False
+        if isinstance(node, ast.Subscript):
+            if not (isinstance(node.value, ast.Name) and node.value.id == "ch"):
+                return False
+            if not (isinstance(node.slice, ast.Constant) and type(node.slice.value) is int):
+                return False
+        if isinstance(node, ast.Constant) and not (node.value is None or type(node.value) in (int, float, bool)):
+            return False
+        # A negative visMin or visMax.
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            if not (isinstance(node.operand, ast.Constant) and type(node.operand.value) in (int, float)):
+                return False
+    return True
+
+
+def _tests_only_for_none(tree: ast.AST, indices: set) -> bool:
+    """Whether a parsed rule expression reads ch[i], for each i in indices, only
+    to test it against None, as the hide-on-disconnect rule does (ch[i] is not None)."""
+    tested = {
+        id(node.left)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare)
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], (ast.Is, ast.IsNot))
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value is None
+    }
+    return all(
+        id(node) in tested for node in ast.walk(tree) if isinstance(node, ast.Subscript) and node.slice.value in indices
+    )
+
+
+def _rule_start(rule: dict, declared: dict) -> Optional[str]:
+    """A Visible or Enable rule's value, "true" or "false", while the loc://
+    variables it reads hold their initial values. None when that is not known
+    here: another rule, a channel that is not a declared loc:// variable, a
+    value only PyDM knows used for more than a test against None, or an
+    expression MultiRule does not write.
+
+    A variable whose value only PyDM knows (see _loc_variable) is still not
+    None to the rule. PyDM's local plugin never sends a None value
+    (local_plugin.py send_new_value), and when it can't convert the init it
+    sends nothing, and the rule shows its initial value. So the
+    hide-on-disconnect rule of a choice button on a variable whose init is a
+    macro starts true, and the button shows whatever the macro is, as in EDM.
+
+    The expression is evaluated as PyDM's rules engine does (rules.py
+    calculate_expression), but only once every node of it passes
+    _rule_nodes_allowed, and with no builtins but float.
+    """
+    if rule.get("property") not in ("Visible", "Enable") or not rule.get("channels"):
+        return None
+    values = []
+    unknown = set()
+    for index, channel in enumerate(rule["channels"]):
+        name, _ = _loc_variable(channel.get("channel"))
+        if name not in declared:
+            return None
+        # PyDM substitutes an enum string for the value unless use_enum is false.
+        if channel.get("use_enum", True):
+            return None
+        if declared[name] is UNKNOWN_VALUE:
+            unknown.add(index)
+        values.append(declared[name])
+    try:
+        tree = ast.parse(rule.get("expression", ""), mode="eval")
+        if not _rule_nodes_allowed(tree) or not _tests_only_for_none(tree, unknown):
+            return None
+        result = eval(compile(tree, "<rule>", "eval"), {"__builtins__": {}}, {"ch": values, "float": float})
+    except Exception:
+        # PyDM logs the error and keeps the initial value.
+        return None
+    if not isinstance(result, bool):
+        return None
+    return "true" if result else "false"
+
+
+def start_rules_at_loc_inits(ui_element: ET.Element) -> None:
+    """Start every Visible or Enable rule that reads only loc:// variables at
+    the value it has for their initial values.
+
+    PyDM's local plugin sends a joining listener the variable's value and only
+    then tells it the channel is connected (local_plugin.py add_listener), and
+    the rules engine skips a value from a channel that is not connected yet
+    (rules.py callback_value) and does not evaluate on connecting
+    (callback_conn). So the last rule to join a variable is not evaluated until
+    the value changes, and shows its initial_value, false, rather than what the
+    variable selects. Rules join in document order, and after the widgets'
+    channels when PyDM's Back and Forward bring a display back.
+
+    PyDM configures a variable from the first address that joins it with both
+    type and init, so the first declaration in the document wins here too, also
+    over a later one with a different init. A widget joins with its channel and
+    its rules' channels, which PyDM's .ui loader sets in document order (a
+    widget's properties before its children); the channel of a widget without
+    a channel property, such as an embedded display, never joins. Waveform
+    curves are not read.
+    """
+    declared = {}
+    rule_properties = []
+    for widget in ui_element.iter("widget"):
+        widget_class = widget.get("class", "")
+        if not widget_class.startswith("PyDM"):
+            continue
+        for prop in widget.findall("property"):
+            string = prop.find("string")
+            if string is None or not string.text:
+                continue
+            if prop.get("name") == "channel" and widget_class not in NO_CHANNEL_CLASSES:
+                addresses = [string.text]
+            elif prop.get("name") == "rules" and widget_class not in NO_RULES_CLASSES:
+                try:
+                    rules = json.loads(string.text)
+                except ValueError:
+                    continue
+                rule_properties.append((string, rules))
+                addresses = [channel.get("channel") for rule in rules for channel in rule.get("channels", [])]
+            else:
+                continue
+            for address in addresses:
+                name, value = _loc_variable(address)
+                if name is not None and value is not None:
+                    declared.setdefault(name, value)
+
+    for string, rules in rule_properties:
+        changed = False
+        for rule in rules:
+            start = _rule_start(rule, declared)
+            if start is not None and start != rule.get("initial_value"):
+                rule["initial_value"] = start
+                changed = True
+        if changed:
+            # As Rules.to_xml writes it: each rule as _json_object, joined by ", ".
+            string.text = json.dumps(rules, ensure_ascii=False)
 
 
 def _as_list(value) -> list:
@@ -1281,29 +1728,31 @@ def shown_display_index(obj: EDMObject) -> int:
     return _starting_index(index, [i for i, _ in block_items(obj.properties.get("displayFileName"))])
 
 
-def pip_source_file(obj: EDMObject) -> Optional[str]:
-    """The file a non-menu embedded window opens (EDM pip.cc), or None for none.
+def pip_source_file(obj: EDMObject) -> Tuple[Optional[str], Optional[str]]:
+    """The file a non-menu embedded window opens (EDM pip.cc) and the channel
+    whose value names it, each None for none.
 
     A "file" window opens its file attribute and shows nothing when that is
-    blank. A "stringPV" window (the default displaySource) opens the file its
-    filePv's value names: known here only as a loc:// string variable's initial
-    value, which is what the window shows when the screen opens.
+    blank. A "stringPV" window (the default displaySource) reads its filePv as
+    a string (pip_readUpdate) and opens the file the value names, again on
+    every non-blank change. The channel drives the display's Filename rule; a
+    loc:// string variable's initial value is also the file it opens with.
     """
     if str(obj.properties.get("displaySource", "")).lower() == "file":
         file = obj.properties.get("file")
         if isinstance(file, str) and file.strip():
-            return file
+            return file, None
         logger.info(f"{obj.name} has displaySource file but no file; it shows nothing, as in EDM")
-        return None
+        return None, None
     file_pv = obj.properties.get("filePv")
     if not isinstance(file_pv, str) or not file_pv.strip():
         logger.info(f"{obj.name} has displaySource stringPV but no filePv; it shows nothing, as in EDM")
-        return None
+        return None, None
     file = loc_str_init(file_pv)
     if not file.strip():
-        logger.warning(f"{obj.name} opens the file named by {file_pv} at runtime; no file emitted")
-        return None
-    return file
+        logger.warning(f"{obj.name} opens the file named by {file_pv} at runtime, through a Filename rule")
+        return None, file_pv
+    return file, file_pv
 
 
 def _walk_objects(group: EDMGroup, hidden: bool = False):
@@ -1356,7 +1805,13 @@ def pair_menu_pips(root: EDMGroup, color_list_dict, skip_widgets: set = None) ->
     A menu mux whose controlPv names the variable writes it too: the generated
     menu mux screen writes the chosen item's index there. The menu becomes part
     of that separate .py rather than a widget in the .ui, so it is never a tab
-    bar, and its window always becomes the switched displays.
+    bar, and its window always becomes the switched displays. So does a window
+    whose menu buttons write the variable (a combo box of its enum strings), or
+    whose message buttons write display indices to it (_index_writers).
+
+    A window whose filePv is a real PV switches on the PV's value the same way:
+    it becomes the switched displays, all hidden until the PV's first value, as
+    EDM opens nothing until then (pip.cc).
 
     skip_widgets is the site's set of EDM classes to drop; pairing rewrites both
     widgets together, so a site dropping either one leaves the tree untouched.
@@ -1365,8 +1820,10 @@ def pair_menu_pips(root: EDMGroup, color_list_dict, skip_widgets: set = None) ->
         logger.info("Skipping menu embedded window pairing (site rule)")
         return
 
-    # A site dropping menu muxes leaves their variables unwritten.
+    # A site dropping menu muxes or buttons leaves their variables unwritten.
     writes_menus = not skip_widgets or "menumuxclass" not in skip_widgets
+    writes_menu_buttons = not skip_widgets or "activemenubuttonclass" not in skip_widgets
+    writes_buttons = not skip_widgets or "activemessagebuttonclass" not in skip_widgets
 
     objects = list(_walk_objects(root))
     # objects holds a reference to every walked object, so keying by id is safe.
@@ -1379,7 +1836,11 @@ def pair_menu_pips(root: EDMGroup, color_list_dict, skip_widgets: set = None) ->
         # (EDM index, file): the variable's value v shows displayFileName[v], and a
         # file may skip indices or start at 1.
         files = block_items(pip.properties.get("displayFileName"))
-        if not match or not files:
+        if not files:
+            continue
+        if not match:
+            if _names_a_pv(file_pv):
+                _stack_pip_displays(pip, parent, file_pv.strip(), files, None)
             continue
         name = match.group(1)
         users = [(obj, group) for obj, group, _ in objects if obj is not pip and name in loc_names[id(obj)]]
@@ -1389,7 +1850,9 @@ def pair_menu_pips(root: EDMGroup, color_list_dict, skip_widgets: set = None) ->
             if isinstance(obj, EDMObject) and obj.name.lower() == "activechoicebuttonclass"
         ]
         menus = [obj for obj, _ in users if _menu_writes(obj, name)] if writes_menus else []
-        if not choices and not menus:
+        menu_buttons = [obj for obj, _ in users if _menu_button_writes(obj, name)] if writes_menu_buttons else []
+        writers = _index_writers(users, name, [index for index, _ in files]) if writes_buttons else []
+        if not choices and not menus and not menu_buttons and not writers:
             continue
 
         # The richest reference defines the variable: most enum strings, then any config at all.
@@ -1412,20 +1875,79 @@ def pair_menu_pips(root: EDMGroup, color_list_dict, skip_widgets: set = None) ->
             else:
                 definition = f"loc://{name}?type=int&init={start}"
 
+        if _loc_init(definition) == -1:
+            # A window whose variable starts at -1 writes 0 on its first value
+            # rather than popping its menu up (pip.cc), so it opens on entry 0.
+            definition = definition.replace("init=-1", "init=0")
+
         if choices and len(users) == 1 and len(files) > 1 and _fits_tab_bar(pip, parent, hidden, *choices[0]):
             _absorb_pip_into_tabs(pip, parent, choices[0][0], files, definition, color_list_dict)
         else:
-            _stack_pip_displays(pip, parent, name, files, definition, users)
+            start = _starting_index(_loc_init(definition), [index for index, _ in files])
+            _stack_pip_displays(pip, parent, f"loc://{name}", files, start)
+            _hand_over_definition(name, definition, users, menu_buttons + writers)
+
+
+def _controls(obj, name: str) -> bool:
+    """The object's controlPv is the variable itself."""
+    control = obj.properties.get("controlPv")
+    match = LOC_NAME_PATTERN.match(control.strip()) if isinstance(control, str) else None
+    return match is not None and match.group(1) == name
 
 
 def _menu_writes(obj, name: str) -> bool:
     """A menu mux whose controlPv is the variable: the generated menu mux screen
     writes the chosen item's index to it (menumux.control_pv)."""
-    if not isinstance(obj, EDMObject) or obj.name.lower() != "menumuxclass":
+    return isinstance(obj, EDMObject) and obj.name.lower() == "menumuxclass" and _controls(obj, name)
+
+
+def _menu_button_writes(obj, name: str) -> bool:
+    """A menu button whose controlPv is the variable: its combo box writes the
+    chosen state's index to it."""
+    return isinstance(obj, EDMObject) and obj.name.lower() == "activemenubuttonclass" and _controls(obj, name)
+
+
+def _as_int(value) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _index_writers(users, name: str, indices: List[int]) -> List[EDMObject]:
+    """The message buttons that write one of the window's display indices to the
+    variable: their controlPv is the variable and their pressValue an index, or
+    a macro (known only when the screen runs).
+
+    None when a message button on the variable asks for a password, which the
+    converted button doesn't: showing the displays it guards would skip it. None
+    either when one writes -1, EDM's popup idiom: on -1 the window pops its menu
+    up (pip.cc), and the stacked displays would all hide.
+    """
+    buttons = [
+        obj
+        for obj, _ in users
+        if isinstance(obj, EDMObject) and obj.name.lower() == "activemessagebuttonclass" and _controls(obj, name)
+    ]
+    if any("password" in obj.properties for obj in buttons):
+        return []
+    if any(_as_int(obj.properties.get(key)) == -1 for obj in buttons for key in ("pressValue", "releaseValue")):
+        return []
+    return [
+        obj
+        for obj in buttons
+        if _as_int(obj.properties.get("pressValue")) in indices or "${" in str(obj.properties.get("pressValue", ""))
+    ]
+
+
+def _names_a_pv(file_pv) -> bool:
+    """A filePv naming a PV: not blank, not a comment (EDM's blankOrComment), and
+    not a LOC\\ or CALC\\ variable the parser left untranslated (a PV name never
+    holds "=")."""
+    if not isinstance(file_pv, str) or not file_pv.strip():
         return False
-    control = obj.properties.get("controlPv")
-    match = LOC_NAME_PATTERN.match(control.strip()) if isinstance(control, str) else None
-    return match is not None and match.group(1) == name
+    pv = file_pv.strip()
+    return not pv.startswith("#") and not re.match(r"(?i)(loc|calc)(\\|\$|://)", pv) and "=" not in pv
 
 
 def _absorb_pip_into_tabs(pip, parent, choice, files, definition, color_list_dict) -> None:
@@ -1480,15 +2002,15 @@ def _absorb_pip_into_tabs(pip, parent, choice, files, definition, color_list_dic
     logger.info(f"Converted choice button and menu embedded window on {definition} to tabs")
 
 
-def _stack_pip_displays(pip, parent, name, files, definition, users) -> None:
+def _stack_pip_displays(pip, parent, channel, files, start) -> None:
     """Replace the window with one embedded display per file, each visible only
-    while the variable equals its EDM index (a group visPv in [i, i + 1)).
+    while the channel equals its EDM index (a group visPv in [i, i + 1)).
 
     files are the window's (EDM index, file) pairs; symbols[i] belongs to
-    displayFileName[i].
+    displayFileName[i]. start is the EDM index of the display that shows when
+    the screen opens, or None for none until the channel's first value.
     """
     symbols = dict(block_items(pip.properties.get("symbols")))
-    start = _starting_index(_loc_init(definition), [index for index, _ in files])
     shared = {
         key: value
         for key, value in pip.properties.items()
@@ -1508,7 +2030,7 @@ def _stack_pip_displays(pip, parent, name, files, definition, users) -> None:
                 height=pip.height,
                 objects=[display],
                 properties={
-                    "visPv": f"loc://{name}",
+                    "visPv": channel,
                     "visMin": str(index),
                     "visMax": str(index + 1),
                     # The starting display's rule begins true so it shows as soon as
@@ -1520,22 +2042,26 @@ def _stack_pip_displays(pip, parent, name, files, definition, users) -> None:
         )
     position = parent.objects.index(pip)
     parent.objects[position : position + 1] = stack
+    logger.info(f"Stacked {len(files)} embedded displays switched by {channel}")
 
-    # PyDM's local plugin takes a variable's type, initial value and enum
-    # strings from the first channel that connects and ignores later ones. The
-    # window carried the full definition; hand it to the choice buttons (which
-    # need the enum strings for their states), to the menu muxes (whose screen
-    # declares the variable from controlPv when the .ui does not) and to every
-    # other configured use.
+
+def _hand_over_definition(name, definition, users, writers) -> None:
+    """PyDM's local plugin takes a variable's type, initial value and enum
+    strings from the first channel that connects and ignores later ones. The
+    window carried the full definition; hand it to the choice buttons (which
+    need the enum strings for their states), to the menu muxes (whose screen
+    declares the variable from controlPv when the .ui does not), to the writers
+    (menu buttons, whose combo boxes need the enum strings too, and index
+    writing message buttons), and to every other configured use."""
     for obj, _ in users:
         is_choice = isinstance(obj, EDMObject) and obj.name.lower() == "activechoicebuttonclass"
-        is_writer = is_choice or _menu_writes(obj, name)
+        is_writer = is_choice or _menu_writes(obj, name) or any(obj is writer for writer in writers)
         for key, value in obj.properties.items():
             if not isinstance(value, str):
                 continue
             if value.startswith(f"loc://{name}?") or (is_writer and value == f"loc://{name}"):
                 obj.properties[key] = definition
-    logger.info(f"Stacked {len(files)} embedded displays switched by {definition}")
+    logger.info(f"loc://{name} is defined by {definition}")
 
 
 def log_unsupported_widget(widget_type, file_path="unsupported_widgets.txt"):
@@ -1548,13 +2074,6 @@ def log_unsupported_widget(widget_type, file_path="unsupported_widgets.txt"):
     if widget_type.lower() not in existing_widgets:
         with open(file_path, "a") as file:
             file.write(widget_type.lower() + "\n")
-
-
-def search_for_edm_attr(obj: EDMObject, target_attr: str):
-    for edm_attr, value in obj.properties.items():
-        pydm_attr = EDM_TO_PYDM_ATTRIBUTES.get(edm_attr)
-        if pydm_attr == target_attr:
-            return value
 
 
 def get_string_value(value: list) -> str:

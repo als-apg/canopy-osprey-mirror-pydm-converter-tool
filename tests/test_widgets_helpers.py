@@ -1,3 +1,4 @@
+import itertools
 import json
 
 import pytest
@@ -6,7 +7,6 @@ from pydmconverter.widgets_helpers import (
     XMLConvertible,
     XMLSerializableMixin,
     Enum,
-    PyDMRule,
     PyDMToolTip,
     TextFormat,
     Color,
@@ -35,6 +35,7 @@ from pydmconverter.widgets_helpers import (
     Text,
     BoolRule,
     MultiRule,
+    Rules,
     escape_qt_mnemonic,
     unescape_qt_mnemonic,
 )
@@ -72,21 +73,6 @@ def test_Enum():
     e = Enum("enumTest", "Value1")
     expected = "\n".join(['<property name="enumTest" stdset="0">', "  <enum>Value1</enum>", "</property>"])
     assert expected == e.to_string()
-
-
-def test_PyDMRule():
-    """
-    Test the PyDMRule class XML output.
-    """
-    rule = PyDMRule("rule1", "someProp", "1+1", "channel1", initial_value=42)
-    expected = "\n".join(
-        [
-            '<property name="rules" stdset="0">',
-            "  <rules>[{'name': 'rule1', 'property': 'someProp', 'initialValue': 42, 'expression': '1+1', 'channel': [{'channel': 'channel1', 'trigger': True, 'use_enum': False}]}]</rules>",
-            "</property>",
-        ]
-    )
-    assert expected == rule.to_string()
 
 
 def test_PyDMToolTip():
@@ -753,6 +739,21 @@ class TestMultiRuleExpression:
         result = rule.get_expression(0, True, None, None, None)
         assert result == "ch[0]==1"
 
+    def test_or_outside_also_holds_outside_every_range(self):
+        """An EDM symbol's state 0 also shows while no other state's range holds the value;
+        an empty range holds no value, so it adds nothing."""
+        rule = MultiRule("Visible", [])
+        result = rule.get_expression(0, True, "0", "1", None, (("1", "2"), ("3", "3"), ("4", "6")))
+        assert result == (
+            "(float(ch[0]) >= 0.0 and float(ch[0]) < 1.0) or "
+            "((float(ch[0]) < 1.0 or float(ch[0]) >= 2.0) and (float(ch[0]) < 4.0 or float(ch[0]) >= 6.0))"
+        )
+
+    def test_or_outside_only_empty_ranges_always_holds(self):
+        rule = MultiRule("Visible", [])
+        result = rule.get_expression(0, True, "1", "1", None, (("2", "2"),))
+        assert result == "(float(ch[0]) >= 1.0 and float(ch[0]) < 1.0) or (True)"
+
     def test_keyword_constructed_rule_arguments(self):
         """RuleArguments field names must match how MultiRule reads them.
 
@@ -770,6 +771,30 @@ class TestMultiRuleExpression:
         result = MultiRule("Visible", [rule]).to_string()
         assert '"initial_value": "true"' in result
         assert '"expression": "(ch[0]!=1)"' in result
+
+
+@pytest.mark.parametrize("order", list(itertools.permutations(range(3))), ids=lambda order: "".join(map(str, order)))
+def test_rules_keep_first_occurrence_order(order):
+    """A widget's Visible terms and channels follow the order its rules were added
+    (group visPvs, then its own), with repeats dropped, whatever the string hashes."""
+    distinct = [
+        RuleArguments("Visible", "ca://OUTER", False, True, None, None),
+        RuleArguments("Visible", "ca://INNER", False, False, None, None),
+        RuleArguments("Visible", "ca://OWN", False, True, "1", "2"),
+    ]
+    added = [distinct[i] for i in order]
+    rules = Rules([*added, added[0], RuleArguments("Enable", "ca://E", False, True, None, None), added[1]])
+    assert rules.group_by_rules()["Visible"] == added
+
+    (visible,) = [r for r in json.loads(rules.to_xml().find("string").text) if r["property"] == "Visible"]
+    assert [c["channel"] for c in visible["channels"]] == [rule.channel for rule in added]
+    terms = {
+        "ca://OUTER": "ch[{}]==1",
+        "ca://INNER": "ch[{}]!=1",
+        "ca://OWN": "float(ch[{0}]) >= 1.0 and float(ch[{0}]) < 2.0",
+    }
+    expected = [terms[rule.channel].format(i) for i, rule in enumerate(added)]
+    assert visible["expression"] == "(" + ") and (".join(expected) + ")"
 
 
 @pytest.mark.parametrize("channel", ["ca://X", r"CALC\sum(A:B,C:D)", 'loc://x?init="a"', "tab\there"])

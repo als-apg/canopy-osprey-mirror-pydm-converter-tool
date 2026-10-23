@@ -10,7 +10,12 @@ import re
 logger = logging.getLogger(__name__)
 
 ALARM_CONTENT_DEFAULT = False
-ALARM_BORDER_DEFAULT = True
+ALARM_BORDER_DEFAULT = False
+
+# The colours PyDM's default stylesheet (pydm/default_stylesheet.qss) gives
+# alarm-sensitive content, by alarmSeverity: MINOR, MAJOR, INVALID, DISCONNECTED.
+# NO_ALARM keeps the widget's own colour.
+PYDM_ALARM_COLORS = {1: "#EBEB00", 2: "#FF0000", 3: "#EB00EB", 4: "#FFFFFF"}
 
 # Widget types whose channel is used as the hidden_channel for rules.
 # These widgets need their visibility controlled via PV-based rules.
@@ -32,6 +37,14 @@ def _json_object(value: dict) -> str:
     """value as the JSON text PyDM reads for a rule or curve: every string
     escaped, separated by ", " and ": " like PyDM's own."""
     return json.dumps(value, ensure_ascii=False)
+
+
+def _range_limits(vis_min, vis_max) -> Tuple[float, float]:
+    """A range rule's (min, max) as numbers; a limit that is not a number empties the range."""
+    try:
+        return float(vis_min), float(vis_max)
+    except (ValueError, TypeError):
+        return 0.0, 0.0
 
 
 class XMLConvertible:
@@ -571,61 +584,6 @@ class Enum(XMLConvertible):
         return prop
 
 
-@dataclass
-class PyDMRule(XMLConvertible):
-    """
-    Represents a PyDM rule for a widget.
-
-    Attributes
-    ----------
-    name : str
-        The name of the rule.
-    rule_property : str
-        The property the rule affects.
-    expression : str
-        The expression for the rule.
-    channel : str
-        The channel associated with the rule.
-    initial_value : Any, optional
-        The initial value for the rule.
-    """
-
-    name: str
-    rule_property: str
-    expression: str
-    channel: str
-    initial_value: Any = None
-
-    def to_xml(self) -> etree.Element:
-        """
-        Convert the PyDM rule to an XML element.
-
-        Returns
-        -------
-        etree.Element
-            The XML element representing the rule.
-        """
-        prop: etree.Element = etree.Element("property", attrib={"name": "rules", "stdset": "0"})
-        rules_struct: list[dict[str, Any]] = [
-            {
-                "name": self.name,
-                "property": self.rule_property,
-                "initialValue": self.initial_value,
-                "expression": self.expression,
-                "channel": [
-                    {
-                        "channel": self.channel,
-                        "trigger": True,
-                        "use_enum": False,
-                    },
-                ],
-            },
-        ]
-        rules: etree.Element = etree.SubElement(prop, "rules")
-        rules.text = str(rules_struct)
-        return prop
-
-
 class Layout:
     """
     Represents a layout configuration for widgets.
@@ -1035,7 +993,9 @@ class MultiRule(XMLConvertible):
                     replacement_init = replacement_init[: replacement_init.find("}") + 1]
                 channel_list.append({"channel": channel, "trigger": True, "use_enum": False})
                 expression_list.append(
-                    self.get_expression(i, rule.show_on_true, rule.visMin, rule.visMax, replacement_init)
+                    self.get_expression(
+                        i, rule.show_on_true, rule.visMin, rule.visMax, replacement_init, rule.or_outside
+                    )
                 )
         if self.hide_on_disconnect_channel is not None:
             new_index = len(self.rule_list)
@@ -1069,7 +1029,9 @@ class MultiRule(XMLConvertible):
             }
         )
 
-    def get_expression(self, index, show_on_true, visMin, visMax, init):  # TODO: Can clean up with fstrings
+    def get_expression(
+        self, index, show_on_true, visMin, visMax, init, or_outside=None
+    ):  # TODO: Can clean up with fstrings
         """
         Build a conditional expression string for a specific channel.
 
@@ -1085,6 +1047,9 @@ class MultiRule(XMLConvertible):
             Maximum threshold value for range-based conditions.
         init : str, optional
             Replacement initialization value for the channel, if applicable.
+        or_outside : tuple of (min, max), optional
+            Ranges a range rule shown on true also holds outside of: it is true
+            while the value is in its range or in none of these.
 
         Returns
         -------
@@ -1095,14 +1060,14 @@ class MultiRule(XMLConvertible):
         ch = f"ch[{index}]"
 
         if visMin is not None and visMax is not None:
-            try:
-                vis_min = float(visMin)
-                vis_max = float(visMax)
-            except (ValueError, TypeError):
-                vis_min = 0.0
-                vis_max = 0.0
+            vis_min, vis_max = _range_limits(visMin, visMax)
             show_on_true_string = f"float({ch}) >= {vis_min} and float({ch}) < {vis_max}"
             show_on_false_string = f"float({ch}) < {vis_min} or float({ch}) >= {vis_max}"
+            if or_outside is not None:
+                # An empty range holds no value, so being outside it says nothing.
+                limits = (_range_limits(*other) for other in or_outside)
+                outside = [f"(float({ch}) < {low} or float({ch}) >= {high})" for low, high in limits if low < high]
+                show_on_true_string = f"({show_on_true_string}) or ({' and '.join(outside) or 'True'})"
         else:
             show_on_true_string = f"{ch}==1"
             show_on_false_string = f"{ch}!=1"  # TODO: maybe need to change from specifically 1 (== 0 or != 0)?
@@ -1141,10 +1106,14 @@ class Rules(XMLConvertible):
         (rule_type, channel, initial_value, show_on_true, visMin, visMax).
     hide_on_disconnect_channel : str, optional
         An additional channel used to hide widgets if it disconnects.
+    extra_rules : list of dict, optional
+        Complete PyDM rules for other properties (an embedded display's
+        Filename), written after the grouped ones as given.
     """
 
     rules: List[RuleArguments]
     hide_on_disconnect_channel: Optional[str] = None
+    extra_rules: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_xml(self):
         """
@@ -1165,7 +1134,10 @@ class Rules(XMLConvertible):
                 rule_list.append(rule_string)
             elif rule_type == "Visible":
                 rule_string = MultiRule(rule_type, [], self.hide_on_disconnect_channel).to_string()
-                rule_list.append(rule_string)
+                # "" when there is no channel to hide on: leave it out of the list.
+                if rule_string:
+                    rule_list.append(rule_string)
+        rule_list.extend(_json_object(rule) for rule in self.extra_rules)
         output_string = f"[{', '.join(rule_list)}]"
         return Str("rules", output_string).to_xml()
 
@@ -1177,7 +1149,8 @@ class Rules(XMLConvertible):
         -------
         dict of str to list of RuleArguments
             A dictionary where the keys are rule types (e.g., "Visible", "Enable"),
-            and the values are lists of unique rules for that type.
+            and the values are lists of unique rules for that type, each in the
+            order its first occurrence was added.
         """
 
         bool_rule_types = ["Visible", "Enable"]
@@ -1185,8 +1158,10 @@ class Rules(XMLConvertible):
         for rule in self.rules:
             if rule.rule_type in rule_variables:
                 rule_variables[rule.rule_type].append(rule)
-        for rule_name in rule_variables.keys():  # removes repeated tuples
-            rule_variables[rule_name] = list(set(rule_variables[rule_name]))
+        for rule_name in rule_variables.keys():
+            # Drop repeats but keep the first of each in place: a set's order follows
+            # the string hashes, so the terms would change order with PYTHONHASHSEED.
+            rule_variables[rule_name] = list(dict.fromkeys(rule_variables[rule_name]))
         return rule_variables
 
 
@@ -1717,6 +1692,7 @@ class Controllable(Tangible):
     visPv: Optional[str] = None
     visInvert: Optional[bool] = None
     rules: Optional[List[str]] = field(default_factory=list)
+    extra_rules: List[Dict[str, Any]] = field(default_factory=list)
     visMin: Optional[Union[int, float, str]] = None
     visMax: Optional[Union[int, float, str]] = None
     text = None
@@ -1746,7 +1722,10 @@ class Controllable(Tangible):
         if self.visPvList is not None:
             for elem in self.visPvList:
                 group_initial = False
-                if len(elem) == 5:
+                group_or_outside = None
+                if len(elem) == 6:
+                    group_channel, group_min, group_max, group_invert, group_initial, group_or_outside = elem
+                elif len(elem) == 5:
                     group_channel, group_min, group_max, group_invert, group_initial = elem
                 elif len(elem) == 4:
                     group_channel, group_min, group_max, group_invert = elem
@@ -1761,18 +1740,20 @@ class Controllable(Tangible):
                         not group_invert,
                         group_min,
                         group_max,
+                        group_or_outside,
                     )
                 )
 
         if self.visPv is not None:
+            # EDM shows the widget while visMin <= value < visMax, reading a missing limit as 0.
             self.rules.append(
                 RuleArguments(
                     "Visible",
                     self.visPv,
                     False,
                     not self.visInvert if self.visInvert is not None else True,
-                    self.visMin,
-                    self.visMax,
+                    self.visMin if self.visMin is not None else "0",
+                    self.visMax if self.visMax is not None else "0",
                 )
             )
 
@@ -1783,7 +1764,7 @@ class Controllable(Tangible):
             hidden_channel = self.symbolChannel
         else:
             hidden_channel = None
-        properties.append(Rules(self.rules, hidden_channel).to_xml())
+        properties.append(Rules(self.rules, hidden_channel, self.extra_rules).to_xml())
         return properties
 
 
@@ -1861,6 +1842,28 @@ class StyleSheetObject(Tangible):
     background_color: Optional[RGBA] = None
     useDisplayBg: Optional[bool] = None
     name: Optional[str] = ""
+    # The declaration PyDM's stylesheet sets for alarm-sensitive content: the
+    # text colour, or a button's or combo box's face. None: no declaration.
+    alarm_content_style: ClassVar[Optional[str]] = "color"
+
+    def alarm_content_rules(self) -> Dict[str, Dict[str, Any]]:
+        """PyDM's alarm colours for this widget's content, as selector rules for
+        its own stylesheet; none unless its content is alarm sensitive.
+
+        A widget's own stylesheet beats the application's whatever the
+        selectors, so its static colours would hide the alarm colours of
+        PyDM's stylesheet: the widget carries them itself, under selectors
+        more specific than its static colours' "*".
+        """
+        if self.alarm_content_style is None or not getattr(self, "alarm_sensitive_content", False):
+            return {}
+        widget_class = type(self).__name__
+        return {
+            f'{widget_class}[alarmSensitiveContent="true"][alarmSeverity="{severity}"]': {
+                self.alarm_content_style: color
+            }
+            for severity, color in PYDM_ALARM_COLORS.items()
+        }
 
     def generate_properties(self) -> List[ET.Element]:
         """
@@ -1883,7 +1886,7 @@ class StyleSheetObject(Tangible):
             styles["color"] = self.foreground_color
         if self.name.startswith("activeMenuButtonClass") or self.name.startswith("activeMessageButtonClass"):
             styles["border"] = "1px solid black"
-        properties.append(StyleSheet(styles).to_xml())
+        properties.append(StyleSheet(styles, self.alarm_content_rules()).to_xml())
 
         return properties
 
@@ -1921,6 +1924,33 @@ class Drawable(Tangible):
     brushColor: Optional[RGBA] = None
     brushFill: Optional[bool] = None
     rotation: Optional[float] = None
+    # PyDM's stylesheet colours an alarm-sensitive drawing's brush itself
+    # (qproperty-brush), which the drawing's own stylesheet never sets.
+    alarm_content_style: ClassVar[Optional[str]] = None
+    # Whether the widget stays transparent around a filled shape. Without its own
+    # background-color it paints the screen's (the Form's stylesheet sets it for every
+    # widget on the screen), which would hide the widgets under an ellipse's corners or
+    # a line's or polygon's bounding box.
+    transparent_when_filled: ClassVar[bool] = False
+
+    def style_sheet(self) -> str:
+        """The widget's own stylesheet, empty for none.
+
+        PyDM's stylesheet gives a drawing with an alarm-sensitive border a 2 px pen
+        (PyDMDrawing[alarmSensitiveBorder="true"] { qproperty-penWidth: 2; }) at every
+        polish, after the .ui has set penWidth, while EDM's lineAlarm only recolours the
+        line. The widget's own stylesheet applies after the application's, so the width
+        is written there too. The cost: a penWidth set later in Designer's property
+        editor is overridden at runtime until the declaration is removed from the
+        styleSheet. PyDM's rule overrides it anyway while the border is alarm
+        sensitive, so only those drawings carry it.
+        """
+        declarations = []
+        if self.brushFill is None or self.transparent_when_filled:
+            declarations.append("background-color: transparent;")
+        if self.penWidth is not None and getattr(self, "alarm_sensitive_border", False):
+            declarations.append(f"qproperty-penWidth: {self.penWidth};")
+        return " ".join(declarations)
 
     def generate_properties(self) -> List[etree.Element]:
         """
@@ -1940,8 +1970,9 @@ class Drawable(Tangible):
             properties.append(PenWidth(width=self.penWidth).to_xml())
         if self.brushColor is not None:
             properties.append(Brush(*self.brushColor, fill=self.brushFill).to_xml())
-        if self.brushFill is None:
-            properties.append(TransparentBackground().to_xml())
+        style_sheet = self.style_sheet()
+        if style_sheet:
+            properties.append(Text("styleSheet", style_sheet).to_xml())
         if self.rotation is not None:
             properties.append(Rotation("rotation", self.rotation).to_xml())
         return properties

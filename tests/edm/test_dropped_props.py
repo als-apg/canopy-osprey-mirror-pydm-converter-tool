@@ -121,7 +121,7 @@ def test_top_shadow_color_is_recorded_as_a_loss():
     count = sum(
         node.dropped_props.count("topShadowColor") for path in EDL_FIXTURES for node in _walk(_source_nodes(path))
     )
-    assert count == 7
+    assert count == 10
 
 
 def test_unknown_widget_records_nothing():

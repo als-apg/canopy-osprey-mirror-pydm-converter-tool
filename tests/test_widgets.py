@@ -4,6 +4,8 @@ import xml.etree.ElementTree as etree
 
 from typing import List, Optional
 
+import pytest
+
 from pydmconverter.widgets import (
     PyDMFrame,
     PyDMLabel,
@@ -21,6 +23,7 @@ from pydmconverter.widgets import (
     PyDMEnumButton,
     PyDMDrawingLine,
     PyDMDrawingPolyline,
+    PyDMDrawingIrregularPolygon,
     PyDMWaveformPlot,
     PyDMAnalogIndicator,
     PyDMEmbeddedDisplay,
@@ -445,12 +448,12 @@ def test_pydmrelateddisplay_button_list_macros():
 def test_edm_to_ui_filename():
     """EDM display names map to .ui names without eating unrelated dots."""
     # EDM appends ".edl" to a bare name, so both forms converge.
-    assert edm_to_ui_filename("GigE_controls") == "GigE_controls.ui"
-    assert edm_to_ui_filename("GigE_controls.edl") == "GigE_controls.ui"
+    assert edm_to_ui_filename("camera_controls") == "camera_controls.ui"
+    assert edm_to_ui_filename("camera_controls.edl") == "camera_controls.ui"
     # A legacy "name.edl;P=..." macro suffix is dropped.
     assert edm_to_ui_filename("a.edl;P=1") == "a.ui"
     # A version dot is part of the name, not an extension.
-    assert edm_to_ui_filename("GigE_v1.2") == "GigE_v1.2.ui"
+    assert edm_to_ui_filename("cam_v1.2") == "cam_v1.2.ui"
     # ".edl" only counts as an extension when it is the actual suffix.
     assert edm_to_ui_filename("screen.edl.bak") == "screen.edl.bak.ui"
     assert edm_to_ui_filename("sub.edl_v2/screen") == "sub.edl_v2/screen.ui"
@@ -461,7 +464,7 @@ def test_edm_to_ui_filename():
 def test_pydmrelateddisplay_button_filenames_converted():
     """displayFileName entries are converted via edm_to_ui_filename, not split on the last dot."""
     widget = PyDMRelatedDisplayButton()
-    widget.displayFileName = ["GigE_v1.2", "a.edl;P=1"]
+    widget.displayFileName = ["cam_v1.2", "a.edl;P=1"]
 
     properties: List[ET.Element] = widget.generate_properties()
 
@@ -470,7 +473,7 @@ def test_pydmrelateddisplay_button_filenames_converted():
     stringlist = filenames_prop.find("stringlist")
     assert stringlist is not None
     strings = [s.text for s in stringlist.findall("string")]
-    assert strings == ["GigE_v1.2.ui", "a.ui"]
+    assert strings == ["cam_v1.2.ui", "a.ui"]
 
 
 # --- Tests for Qt mnemonic (&) escaping ---
@@ -852,3 +855,99 @@ def test_pydmembeddeddisplay_non_pip_has_no_border():
     assert last_style_sheet(widget.to_xml()) == "color: rgba(0, 0, 255, 255);background-color: none;"
     plain = PyDMEmbeddedDisplay(name="activeChoiceButtonClass1_page1")
     assert last_style_sheet(plain.to_xml()) == "background-color: transparent;"
+
+
+ALARM_SELECTORS = [f'[alarmSensitiveContent="true"][alarmSeverity="{severity}"]' for severity in (1, 2, 3, 4)]
+
+
+def test_pydmlabel_without_alarm_keeps_its_plain_style_sheet():
+    label = PyDMLabel(foreground_color=RGBA(0, 0, 0), background_color=RGBA(187, 187, 187))
+
+    assert last_style_sheet(label.to_xml()) == "background-color: rgba(187, 187, 187, 255); color: rgba(0, 0, 0, 255);"
+
+
+def test_pydmlabel_alarm_content_carries_pydm_alarm_colours():
+    label = PyDMLabel(
+        foreground_color=RGBA(0, 0, 0), background_color=RGBA(187, 187, 187), alarm_sensitive_content=True
+    )
+
+    # Its own sheet beats PyDM's whatever the selectors: the static colours go under "*" and the
+    # alarm colours under selectors that outrank it. Bare declarations next to them would void the sheet.
+    assert last_style_sheet(label.to_xml()) == (
+        "* { background-color: rgba(187, 187, 187, 255); color: rgba(0, 0, 0, 255); } "
+        f"PyDMLabel{ALARM_SELECTORS[0]} {{ color: #EBEB00; }} "
+        f"PyDMLabel{ALARM_SELECTORS[1]} {{ color: #FF0000; }} "
+        f"PyDMLabel{ALARM_SELECTORS[2]} {{ color: #EB00EB; }} "
+        f"PyDMLabel{ALARM_SELECTORS[3]} {{ color: #FFFFFF; }}"
+    )
+
+
+def test_pydmlineedit_alarm_content_colours_its_text():
+    style = last_style_sheet(PyDMLineEdit(foreground_color=RGBA(0, 0, 0), alarm_sensitive_content=True).to_xml())
+
+    assert style.startswith("* { color: rgba(0, 0, 0, 255);background-color: none; } ")
+    assert f"PyDMLineEdit{ALARM_SELECTORS[1]} {{ color: #FF0000; }}" in style
+
+
+def test_pydmpushbutton_alarm_content_colours_its_face_in_every_style_sheet():
+    button = PyDMPushButton(
+        name="activeButtonClass1",
+        foreground_color=RGBA(0, 0, 0),
+        on_color=RGBA(187, 187, 187),
+        off_color=RGBA(187, 187, 187),
+    )
+    button.alarm_sensitive_content = True
+    sheets = [get_property_value(prop) for prop in button.to_xml().findall("property[@name='styleSheet']")]
+
+    # The .ui loader applies them in order, so each must carry the alarm colours.
+    assert sheets
+    for sheet in sheets:
+        assert sheet.startswith("* { ")
+        assert f"PyDMPushButton{ALARM_SELECTORS[1]} {{ background-color: #FF0000; }}" in sheet
+    assert sheets[-1].startswith("* { color: rgba(0, 0, 0, 255); background-color: rgba(187, 187, 187, 255); } ")
+
+
+def style_sheets(widget) -> List[str]:
+    return [get_property_value(prop) for prop in widget.to_xml().findall("property[@name='styleSheet']")]
+
+
+def test_drawing_alarm_content_adds_no_style_sheet_rules():
+    # PyDM's own stylesheet colours the brush (qproperty-brush); the ellipse's sheet doesn't touch it.
+    ellipse = PyDMDrawingEllipse(alarm_sensitive_content=True)
+
+    assert style_sheets(ellipse) == ["background-color: transparent;"]
+
+
+@pytest.mark.parametrize(
+    "widget, sheet",
+    [
+        (PyDMDrawingRectangle(penWidth=4), "background-color: transparent;"),
+        (
+            PyDMDrawingRectangle(penWidth=4, alarm_sensitive_border=True),
+            "background-color: transparent; qproperty-penWidth: 4;",
+        ),
+        (PyDMDrawingRectangle(penWidth=3, brushFill=True, alarm_sensitive_border=True), "qproperty-penWidth: 3;"),
+        (
+            PyDMDrawingPolyline(penWidth=3, alarm_sensitive_border=True),
+            "background-color: transparent; qproperty-penWidth: 3;",
+        ),
+        # A filled shape that doesn't cover its widget leaves the widgets under the rest of it showing.
+        (
+            PyDMDrawingEllipse(penWidth=2, brushFill=True, alarm_sensitive_border=True),
+            "background-color: transparent; qproperty-penWidth: 2;",
+        ),
+        (PyDMDrawingPolyline(penWidth=1, arrows="both"), "background-color: transparent;"),
+        (PyDMDrawingIrregularPolygon(penWidth=2, brushFill=True), "background-color: transparent;"),
+    ],
+)
+def test_drawing_writes_one_style_sheet_with_its_alarm_pen_width(widget, sheet):
+    """PyDM's stylesheet sets an alarm-sensitive border's pen to 2 px at every polish; only the drawing's own
+    stylesheet, applied after it, keeps EDM's width."""
+    assert style_sheets(widget) == [sheet]
+
+
+def test_alarmable_draws_no_alarm_border_by_default():
+    properties = {prop.get("name"): get_property_value(prop) for prop in PyDMDrawingRectangle().generate_properties()}
+
+    assert properties["alarmSensitiveContent"] == "false"
+    assert properties["alarmSensitiveBorder"] == "false"
