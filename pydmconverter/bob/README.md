@@ -83,7 +83,8 @@ warnings:
 1. **`BOB_TO_QT_CLASS`** — Phoebus widget `type` -> `(Qt class, registry id)`, e.g.
    `action_button` -> `("QPushButton", "regular-button")`, `led` -> `("PyDMSymbol",
    "pv-led")`. `tabs` is deliberately absent (the registry has no `qtPropMap` for
-   tabs) and stays `unknown-widget`.
+   tabs) and stays `unknown-widget`. `navtabs` is absent too: `navtabs.py` lowers it to a frameless group of
+   open-display buttons, one per tab with that tab's own file and macros (the tab body is not embedded).
 2. **`BOB_TO_QT_PROP`** / **`BOB_TO_QT_PROP_BY_TYPE`** — Phoebus property name -> Qt
    property name. The by-type table overrides the generic table per widget type,
    including `None` entries that mean "deliberately not mapped" (e.g.

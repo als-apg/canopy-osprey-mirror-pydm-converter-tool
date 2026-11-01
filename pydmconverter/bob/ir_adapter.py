@@ -58,6 +58,7 @@ from pydmconverter.bob.formula_pv import lower_formula_pv
 from pydmconverter.bob.groups import child_geometry, group_node
 from pydmconverter.bob.local_pv import local_pv_key, plan_declarers, rewrite_local_pv
 from pydmconverter.bob.meta import build_meta
+from pydmconverter.bob.navtabs import NAVTABS_WARNING, navtab_buttons
 from pydmconverter.bob.parser import BobDisplay, BobRule, BobWidget, parse_bob, prop_text
 from pydmconverter.bob.rules import RuleContext, coerce_value, is_true, lower_rule
 from pydmconverter.bob.scripts import ScriptFileContext, build_writer_census, match_alarm_boilerplate, match_loc_formula
@@ -325,6 +326,11 @@ class _WidgetLowering:
             self.qt_props.update(group_props)
             if registry_id == "group":
                 self.qt_props["layoutMode"] = "absolute"
+        elif widget.type == "navtabs":
+            # A frameless group holding one open-display button per tab (navtabs.py).
+            qt_class, registry_id = None, "group"
+            self.qt_props["layoutMode"] = "absolute"
+            self.warn(NAVTABS_WARNING.format(widget=self.name))
         elif mapped is not None:
             qt_class, registry_id = mapped
         else:
@@ -336,7 +342,7 @@ class _WidgetLowering:
         for message in self.state.declarer_warnings.pop(self.name, []):
             self.warn(message)
 
-        if not self.unknown:
+        if not self.unknown and widget.type != "navtabs":
             self._props()
         self._rules(registry_id)
         unlowered_scripts = self._scripts(registry_id)
@@ -670,7 +676,10 @@ def _lower_tree(
             state.named_props[id(node)] = lowering.named_props
         for key, name, pv in lowering.targets:
             state.targets.setdefault(key, _Target(name=name, pv=pv, widget=widget.name, node=node))
-        node.children = _lower_tree(widget.children, state, widget, (geometry[0], geometry[1]))
+        if widget.type == "navtabs":
+            node.children = navtab_buttons(widget, (geometry[0], geometry[1]), node.warnings.append)
+        else:
+            node.children = _lower_tree(widget.children, state, widget, (geometry[0], geometry[1]))
         nodes.append(node)
     return nodes
 
