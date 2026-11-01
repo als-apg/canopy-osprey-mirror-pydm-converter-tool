@@ -47,11 +47,13 @@ from pydmconverter.bob.coercion import (
     BUILTIN_NAMED_COLORS,
     RGBA,
     alignment,
+    color_name_of,
     font_size,
     load_color_def,
     points,
 )
 from pydmconverter.colors import ColorContext, named_color
+from pydmconverter.pairing import NamedColor, pair_text_colors
 from pydmconverter.bob.formula_pv import lower_formula_pv
 from pydmconverter.bob.groups import child_geometry, group_node
 from pydmconverter.bob.local_pv import local_pv_key, plan_declarers, rewrite_local_pv
@@ -185,6 +187,8 @@ class _File:
     declarer_warnings: dict[str, list[str]] = field(default_factory=dict)
     targets: dict[str, _Target] = field(default_factory=dict)
     color: ColorContext | None = None
+    # id(node) -> {qt prop: (source colour name, RGBA, Phoebus prop)} for the pairing pass.
+    named_props: dict[int, dict[str, NamedColor]] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -289,6 +293,7 @@ class _WidgetLowering:
         self.targets: list[tuple[str, str, str]] = []  # (key, formula name, target pv)
         self.unknown = False
         self._script_actions: list[dict] = []
+        self.named_props: dict[str, NamedColor] = {}
 
     # -- helpers ------------------------------------------------------------
     def warn(self, message: str) -> None:
@@ -384,6 +389,10 @@ class _WidgetLowering:
             coerced = self.coerce(kind, value)
             if coerced is not None:
                 self.qt_props[qt_prop] = coerced
+                if kind == "color":
+                    named = color_name_of(value, self.state.named, self.state.color)
+                    if named is not None:
+                        self.named_props[qt_prop] = (*named, prop)
 
         self._pv(props)
         self._text(props)
@@ -657,6 +666,8 @@ def _lower_tree(
         geometry = _geometry(widget, parent, origin)
         lowering = _WidgetLowering(widget, state, geometry)
         node = lowering.lower()
+        if lowering.named_props:
+            state.named_props[id(node)] = lowering.named_props
         for key, name, pv in lowering.targets:
             state.targets.setdefault(key, _Target(name=name, pv=pv, widget=widget.name, node=node))
         node.children = _lower_tree(widget.children, state, widget, (geometry[0], geometry[1]))
@@ -749,6 +760,13 @@ def _display_to_ir(
         # An undeclared display background is the scheme's Display_Background when its
         # light value is Phoebus's white; otherwise the literal white, with a parity note.
         background = named_color("Display_Background", _DISPLAY_BACKGROUND_RGB, "background_color", color)
+    # Text and the ground under it become roles together or stay literal together.
+    background = pair_text_colors(
+        nodes,
+        background or DISPLAY_BACKGROUND_DEFAULT,
+        color,
+        lambda node, prop: state.named_props.get(id(node), {}).get(prop),
+    )
     # Scheme parity notes are aggregated over the whole document and lead the file warnings.
     if color is not None:
         file_warnings[:0] = color.parity_notes()

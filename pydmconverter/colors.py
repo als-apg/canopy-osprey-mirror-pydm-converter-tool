@@ -57,7 +57,7 @@ class _Mismatch:
     role: str
     fallback: str
     count: int = 0
-    slots: list[str] = field(default_factory=list)
+    slots: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -77,8 +77,20 @@ class ParityNotes:
         key = (name, tuple(rgb), role, basis, value)
         entry = self.entries.setdefault(key, _Mismatch(role=role, fallback=fallback))
         entry.count += 1
-        if slot not in entry.slots:
-            entry.slots.append(slot)
+        entry.slots[slot] = entry.slots.get(slot, 0) + 1
+
+    def waive(self, name: str, rgb: RGBA, role: str, slot: str) -> None:
+        """Take back one :meth:`record` of ``name`` as ``role`` for ``slot``: the colour became the role after all."""
+        for key, entry in list(self.entries.items()):
+            if key[0] != name or key[1] != tuple(rgb) or key[2] != role or slot not in entry.slots:
+                continue
+            entry.count -= 1
+            entry.slots[slot] -= 1
+            if entry.slots[slot] <= 0:
+                del entry.slots[slot]
+            if entry.count <= 0:
+                del self.entries[key]
+            return
 
     def notes(self) -> list[str]:
         """One ``parity: `` message per key, in first-seen order, with its count."""
@@ -101,6 +113,8 @@ class ColorContext:
     slot object ``{"role": default, "<slot>": role}``. ``light`` maps each role to its
     light value and ``sources`` each restyled role to the Phoebus value it replaces.
     ``named`` is the colour-name table in force (built-ins or ``color.def``).
+    ``dark`` maps each role to its dark value (read by the text/ground pairing,
+    :mod:`pydmconverter.pairing`), and ``pairs`` aggregates that pass's notes.
     ``parity`` aggregates the document's mismatches. ``slot``, when set, is the property
     coloured by an element that does not name it (a rule arm's ``<value>``, a bare name);
     see :meth:`with_slot`.
@@ -113,6 +127,8 @@ class ColorContext:
     parity: ParityNotes = field(default_factory=ParityNotes)
     sources: dict[str, str] = field(default_factory=dict)
     slot: str | None = None
+    dark: dict[str, str] = field(default_factory=dict)
+    pairs: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_scheme(
@@ -121,9 +137,10 @@ class ColorContext:
         """Build the context of one document from a flattened scheme."""
         flat = scheme.flat
         light = dict(zip(flat.get("roles", []), flat.get("light", [])))
+        dark = dict(zip(flat.get("roles", []), flat.get("dark", [])))
         imports = {kind: dict(table or {}) for kind, table in (scheme.imports or {}).items()}
         sources = dict(scheme.sources or {})
-        return cls(imports=imports, light=light, named=named, import_kind=import_kind, sources=sources)
+        return cls(imports=imports, light=light, named=named, import_kind=import_kind, sources=sources, dark=dark)
 
     def with_slot(self, slot: str) -> ColorContext:
         """This context for colours of property ``slot``; it shares the document's parity notes."""
@@ -152,8 +169,13 @@ class ColorContext:
         return "light", canonical_hex(self.light[role])
 
     def parity_notes(self) -> list[str]:
-        """The aggregated ``parity: `` notes of this document."""
-        return self.parity.notes()
+        """The aggregated ``parity: `` notes of this document, then its ``pair: `` notes."""
+        pairs = [f"{note} ({count} {'use' if count == 1 else 'uses'})" for note, count in self.pairs.items()]
+        return self.parity.notes() + pairs
+
+    def note_pair(self, note: str) -> None:
+        """Count one ``pair: `` note (aggregated per document like the parity notes)."""
+        self.pairs[note] = self.pairs.get(note, 0) + 1
 
 
 def named_color(name: str | None, rgb: RGBA, slot: str, ctx: ColorContext | None) -> ColorValue:

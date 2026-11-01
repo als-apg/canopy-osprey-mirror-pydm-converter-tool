@@ -204,6 +204,20 @@ def color_from_element(
     return rgba_to_hex(rgb)
 
 
+def color_name_of(
+    elem: object, named: dict[str, RGBA] | None = None, ctx: ColorContext | None = None
+) -> tuple[str, RGBA] | None:
+    """``(name, RGBA)`` of a named ``<color>`` (or a property element wrapping one), as
+    :func:`color_from_element` resolves it; ``None`` for an unnamed or unresolvable colour."""
+    color = _color_elem(elem) if isinstance(elem, ET.Element) else None
+    name = color.get("name") if color is not None else None
+    if name is None:
+        return None
+    table = _table(named, ctx)
+    rgb = table.get(name) or _rgb_attrs(color)
+    return None if rgb is None else (name, rgb)
+
+
 def _rgb_attrs(color: ET.Element) -> RGBA | None:
     try:
         r, g, b = (int(float(color.get(k, ""))) for k in ("red", "green", "blue"))

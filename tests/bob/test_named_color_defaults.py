@@ -4,7 +4,8 @@ Alarm colours, the rule colour fallback, rule arms and defaults, the Phoebus-nam
 widget defaults (``BOB_DEFAULTS``) and the undeclared display background all go
 through :func:`~pydmconverter.colors.named_color`: a scheme role when the role's
 light value equals the hex the converter writes today, else that hex with a
-``parity:`` note. Defaults with no Phoebus name stay literal. Panels and schemes are
+``parity:`` note, unless the text pairing (:mod:`pydmconverter.pairing`) makes a default
+text the role of the ground it sits on. Defaults with no Phoebus name stay literal. Panels and schemes are
 synthetic, except the last tests, which use the vendored ``canopy-default`` scheme.
 """
 
@@ -272,8 +273,11 @@ def test_undeclared_display_background_with_vendored_canopy_default(body):
     assert wire["root"]["props"]["backgroundColor"] == {"$role": "Display_Background", "fallback": "#ffffff"}
 
 
-def test_vendored_canopy_default_text_differs_so_label_default_stays_literal():
-    # canopy-default's Text light is not Phoebus black: parity keeps today's hex.
+def test_vendored_canopy_default_label_default_pairs_with_the_display_background():
+    # canopy-default's Text light (#161616) is not Phoebus black, so parity alone would keep
+    # black text on the Display_Background role (unreadable in the dark theme). Pairing makes
+    # the text the Text role and drops the parity note for it.
     (label,) = _children(_wire(_panel(_LABEL), load_scheme(None)))
-    assert label["props"]["foregroundColor"] == "#000000"
-    assert any("'Text'" in note for note in _parity(label))
+    assert label["props"]["foregroundColor"] == _role("Text", "#000000")
+    assert not any("'Text'" in note for note in _parity(label))
+    assert any(w.startswith("pair: color 'Text'") for w in label.get("warnings", []))
