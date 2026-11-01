@@ -27,7 +27,7 @@ source repo. Sources are repo-relative (`<repo>: <path>`).
 
 | Vendored file | Source | sha256 |
 |---|---|---|
-| `screen-ir.schema.json` | `canopy-sdk-js: packages/screen-ir/schema/screen-ir.schema.json` | `ff511cbc4b198c109981b97f380eeeb349418b8750c7eedd26d51513b71afc98` |
+| `screen-ir.schema.json` | `canopy-sdk-js: packages/screen-ir/schema/screen-ir.schema.json` | `f672ff1800881ddaa788744448a3972ed0c89ef5aab032d7b7dfcf8f9014a7de` |
 | `canopy-color-scheme-1.schema.json` | `canopy-sdk-js: packages/screen-ir/schema/canopy-color-scheme-1.schema.json` | `94b2e2cb5c0ee1854ebe2b806ba2c52213f9ef2d218cb11a1be49bde3562c2b2` |
 | `schemes/canopy-default.json` | `canopy: src/canopy/converter/data/schemes/canopy-default.json` | `0a8f403e70f0b9a5dc2eb9679da24f72f54209e19a8a9043d3de636e49ce810d` |
 
