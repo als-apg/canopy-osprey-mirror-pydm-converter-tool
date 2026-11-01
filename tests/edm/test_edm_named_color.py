@@ -46,6 +46,15 @@ def palette(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def white_palette(tmp_path: Path) -> Path:
+    """The palette with a white "GLOBAL canvas": the widgets' grounds become roles too, so
+    text roles stay roles (on the grey canvas the pairing keeps the alarm-coloured text literal)."""
+    path = tmp_path / "white.list"
+    path.write_text(PALETTE.replace("0xbbbb 0xbbbb 0xbbbb", "0xffff 0xffff 0xffff"), encoding="utf-8", newline="\n")
+    return path
+
+
+@pytest.fixture
 def scheme():
     return load_scheme(None)
 
@@ -75,10 +84,23 @@ def test_edm_color_name_without_palette_is_none():
 # --- conversion with a scheme -----------------------------------------------------------------
 
 
-def test_mapped_name_with_matching_light_becomes_a_role(palette, scheme):
-    widgets = _widgets(edm_file_to_ir(FIXTURE, color_list_path=palette, scheme=scheme))
+def test_mapped_name_with_matching_light_becomes_a_role(white_palette, scheme):
+    widgets = _widgets(edm_file_to_ir(FIXTURE, color_list_path=white_palette, scheme=scheme))
     assert widgets[0].props["foregroundColor"] == {"$role": "MAJOR", "fallback": "#da1e28"}
+    assert widgets[0].props["backgroundColor"] == {"$role": "Display_Background", "fallback": "#ffffff"}
     assert widgets[3].props["foregroundColor"] == {"$role": "OK", "fallback": "#24a148"}
+
+
+def test_role_text_on_a_literal_grey_canvas_stays_literal(palette, scheme):
+    # MAJOR's and OK's dark values are unreadable on #bbbbbb, which stays literal (parity): pairing keeps them literal.
+    widgets = _widgets(edm_file_to_ir(FIXTURE, color_list_path=palette, scheme=scheme))
+    assert (widgets[0].props["foregroundColor"], widgets[3].props["foregroundColor"]) == ("#da1e28", "#24a148")
+    assert any(w.startswith("pair: scheme role 'MAJOR' of a text kept as #da1e28") for w in widgets[0].warnings)
+
+
+def test_unmapped_black_text_keeps_its_own_role_background_literal(white_palette, scheme):
+    widgets = _widgets(edm_file_to_ir(FIXTURE, color_list_path=white_palette, scheme=scheme))
+    assert (widgets[1].props["foregroundColor"], widgets[1].props["backgroundColor"]) == ("#000000", "#ffffff")
 
 
 def test_unmapped_name_stays_literal(palette, scheme):
@@ -107,8 +129,8 @@ def test_parity_mismatch_keeps_literal_and_leads_the_first_node_warnings(palette
         assert not any(w.startswith("parity: ") for w in widget.warnings)
 
 
-def test_scheme_output_is_stamped_and_validates(palette, scheme):
-    ir = react.convert_to_ir(FIXTURE, color_list_path=palette, scheme=scheme)
+def test_scheme_output_is_stamped_and_validates(white_palette, scheme):
+    ir = react.convert_to_ir(FIXTURE, color_list_path=white_palette, scheme=scheme)
     assert ir.schema_version == "1.1"
     assert validate_screen_json(to_wire_dict(ir)) == []
 
@@ -127,8 +149,10 @@ def test_no_scheme_is_byte_identical_to_scheme_none(palette):
     assert not any(w.startswith("parity: ") for widget in widgets for w in widget.warnings)
 
 
-def test_scheme_only_changes_the_role_props(palette, scheme):
-    """Replacing each role by its fallback gives back the no-scheme output, minus parity notes."""
+@pytest.mark.parametrize("which", ["palette", "white_palette"])
+def test_scheme_only_changes_the_role_props(which, request, scheme):
+    """Replacing each role by its fallback gives back the no-scheme output, minus parity and pair notes."""
+    palette = request.getfixturevalue(which)
     plain = to_wire_dict(react.convert_to_ir(FIXTURE, color_list_path=palette))
     themed = to_wire_dict(react.convert_to_ir(FIXTURE, color_list_path=palette, scheme=scheme))
 
@@ -141,21 +165,21 @@ def test_scheme_only_changes_the_role_props(palette, scheme):
                 del out["warnings"]  # the parity note was a node's only warning
             return out
         if isinstance(value, list):
-            return [strip(v) for v in value if not (isinstance(v, str) and v.startswith("parity: "))]
+            return [strip(v) for v in value if not (isinstance(v, str) and v.startswith(("parity: ", "pair: ")))]
         return value
 
-    assert (plain.pop("schemaVersion"), themed.pop("schemaVersion")) == ("1.0", "1.1")
+    plain.pop("schemaVersion"), themed.pop("schemaVersion")
     assert strip(themed) == strip(plain)
 
 
 # --- through convert_bytes --------------------------------------------------------------------
 
 
-def test_convert_bytes_edl_passes_scheme(palette, scheme):
-    ir = react.convert_bytes(FIXTURE.read_bytes(), kind="edl", color_list_path=palette, scheme=scheme)
+def test_convert_bytes_edl_passes_scheme(white_palette, scheme):
+    ir = react.convert_bytes(FIXTURE.read_bytes(), kind="edl", color_list_path=white_palette, scheme=scheme)
     widgets = _widgets(ir)
     assert widgets[0].props["foregroundColor"] == {"$role": "MAJOR", "fallback": "#da1e28"}
-    assert widgets[0].warnings[0].startswith("parity: ")
+    assert widgets[0].warnings[0].startswith("pair: ")
     assert ir.schema_version == "1.1"
 
 

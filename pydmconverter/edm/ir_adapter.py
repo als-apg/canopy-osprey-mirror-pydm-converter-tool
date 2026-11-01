@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from pydmconverter.colors import ColorContext, ColorValue, named_color
+from pydmconverter.pairing import pair_text_colors
 from pydmconverter.edm.edm_qt import (
     EDM_DATA_PV_ATTRS,
     EDM_TEXT_VALUE_CLASSES,
@@ -1651,6 +1652,10 @@ def _convert_object(
             override = fixup(obj, qt_props, warnings)
             if override is not None:
                 geometry = override
+        if qt_class == "PyDMLabel" and "showUnits" not in obj.properties:
+            # EDM prints a readback's units only when the object sets showUnits
+            # (Textupdate has no units at all); the IR's default shows them.
+            qt_props["showUnits"] = False
     return SourceNode(
         qt_class=qt_class,
         qt_props=qt_props,
@@ -1989,9 +1994,6 @@ def edm_file_to_ir(
         parser.ui, colors=colors, skip_classes=skip_classes, color=color, registry=registry
     )
     _name_windows(top_level, path.stem)
-    # Scheme parity notes are aggregated over the whole document and lead the first node's warnings.
-    if color is not None and top_level:
-        top_level[0].warnings[:0] = color.parity_notes()
     builder = IRBuilder(registry)
     # Screen background: the parser resolves bgColor to an (r, g, b, a) tuple.
     background: str | None = None
@@ -2000,6 +2002,12 @@ def edm_file_to_ir(
         background = "#{:02x}{:02x}{:02x}".format(int(bg.r), int(bg.g), int(bg.b))
     elif isinstance(bg, (tuple, list)) and len(bg) >= 3:
         background = "#{:02x}{:02x}{:02x}".format(int(bg[0]), int(bg[1]), int(bg[2]))
+    # Text and the ground under it become roles together or stay literal together; a
+    # readback that paints no background says so (EDM shows the display through it).
+    background = pair_text_colors(top_level, background, color)
+    # Scheme parity notes are aggregated over the whole document and lead the first node's warnings.
+    if color is not None and top_level:
+        top_level[0].warnings[:0] = color.parity_notes()
     # The EDM window is exactly the declared w x h (objects outside it are clipped,
     # hidden ones parked off-screen on purpose), so the canvas does not grow to fit.
     # Only a dimension the file does not declare is sized from the content.
