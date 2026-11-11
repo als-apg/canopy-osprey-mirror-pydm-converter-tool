@@ -49,7 +49,8 @@
             {
               "type": "write_pv",
               "pvName": "loc://flag?type=str&init=on",
-              "value": "2"
+              "value": "2",
+              "description": "Set 2"
             }
           ]
         },

@@ -36,14 +36,16 @@
             {
               "type": "open_display",
               "file": "a.screen.json",
-              "target": "replace"
+              "target": "replace",
+              "description": "Open A"
             },
             {
               "type": "open_display",
               "file": "b.screen.json",
               "target": "replace"
             }
-          ]
+          ],
+          "actionsAsMenu": true
         },
         "geometry": {
           "x": 0,

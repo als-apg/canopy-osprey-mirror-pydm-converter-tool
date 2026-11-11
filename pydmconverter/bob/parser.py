@@ -116,6 +116,10 @@ class BobWidget:
     actions: list[BobAction] = field(default_factory=list)
     macros: dict[str, str] = field(default_factory=dict)
     type_id: str | None = None
+    # ``<actions execute_as_one="true">`` (BOY: ``hook_all``): one click runs every
+    # action in order. False, the Phoebus default, makes an action button with two or
+    # more actions a menu that runs the one picked.
+    actions_as_one: bool = False
 
 
 @dataclass
@@ -272,6 +276,8 @@ def _widget(el: ET.Element, base_dir: Path | None, confine: bool) -> BobWidget:
         actions=[_action(a) for a in actions_el.findall("action")] if actions_el is not None else [],
         macros=_macros(el.find("macros")),
         type_id=type_id,
+        actions_as_one=actions_el is not None
+        and any(actions_el.get(attr, "").strip().lower() == "true" for attr in ("execute_as_one", "hook_all")),
     )
     _substitute_pv_name(widget)
     return widget

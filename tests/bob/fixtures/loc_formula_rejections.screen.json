@@ -76,7 +76,8 @@
             {
               "type": "write_pv",
               "pvName": "loc://shared",
-              "value": "1"
+              "value": "1",
+              "description": "Set"
             }
           ]
         },

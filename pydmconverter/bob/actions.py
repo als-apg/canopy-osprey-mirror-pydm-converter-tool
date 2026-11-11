@@ -23,6 +23,9 @@ entry per action in document order, in the builder ``Action`` shape:
 * ``execute`` (a Jython/JavaScript script) has no web equivalent: a tier-2 warning and
   no entry.
 
+Every emitted action keeps a non-empty ``<description>`` as ``description``: a menu
+names its items by it.
+
 ``command`` and ``execute`` actions are also *carried*: handed to ``ctx`` so the source
 carry-over (:func:`~pydmconverter.bob.meta.build_meta`) can show them verbatim.
 
@@ -173,6 +176,7 @@ def lower_actions(widget: BobWidget, ctx: Any) -> list[dict]:
     command_warned = False
     for action in widget.actions:
         kind = action.type
+        mark = len(out)
         if kind in _OPEN_DISPLAY:
             entry = _open_display(action, name, ctx)
             if entry is not None:
@@ -206,6 +210,10 @@ def lower_actions(widget: BobWidget, ctx: Any) -> list[dict]:
             out.append({"type": "close_display"})
         else:
             _warn(ctx, f"{name}: action type {kind} not supported")
+        # The description names the action where a menu lists it (an action button
+        # with ``actionsAsMenu``); ``execute`` already carries it.
+        if len(out) > mark and action.description and "description" not in out[-1]:
+            out[-1]["description"] = normalize_macro_syntax(action.description)
     return out
 
 

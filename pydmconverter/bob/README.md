@@ -27,7 +27,10 @@ warnings:
   does not run shell commands. An `open_webpage` URL that is not `http`, `https` or
   relative is dropped with a warning; so is any file a display names (`open_file`,
   `open_display`, embedded/picture files, button images, `file` rule values) that is
-  not a path, or that starts with a macro.
+  not a path, or that starts with a macro. An `action_button` with two or more
+  actions and no `execute_as_one` (BOY: `hook_all`) is a menu in Phoebus, so it gets
+  `actionsAsMenu: true`; each action keeps its `<description>` as the menu item's
+  name.
 - **Tier 2**: needs a script runtime. Any other script or `execute` action warns and is
   carried in `meta.comment` instead of being converted.
 
