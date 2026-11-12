@@ -4,6 +4,7 @@
   "qtPropMap": {
     "text": { "to": "label" },
     "actions": { "to": "actions" },
+    "actionsAsMenu": { "to": "actionsAsMenu" },
     "fontSize": { "to": "fontSize" },
     "flat": { "to": "transparent" }
   }

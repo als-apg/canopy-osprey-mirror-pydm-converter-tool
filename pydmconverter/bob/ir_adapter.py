@@ -348,10 +348,16 @@ class _WidgetLowering:
             self._props()
         self._rules(registry_id)
         unlowered_scripts = self._scripts(registry_id)
-        actions = lower_actions(widget, self.action_ctx) + self._script_actions
+        own_actions = lower_actions(widget, self.action_ctx)
+        actions = own_actions + self._script_actions
         if widget.type == "action_button":
             self.qt_props["text"] = action_button_label(widget)
             self.qt_props["actions"] = actions
+            # Phoebus runs every action of a button only with execute_as_one; else a
+            # button with two or more actions is a menu that runs the one picked.
+            # A button that also carries script actions keeps running the list.
+            if len(own_actions) >= 2 and not widget.actions_as_one and not self._script_actions:
+                self.qt_props["actionsAsMenu"] = True
         elif actions:
             self.qt_props["actions"] = actions
 

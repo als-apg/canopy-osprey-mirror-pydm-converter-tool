@@ -55,7 +55,8 @@
             {
               "type": "write_pv",
               "pvName": "loc://target?type=int&init=3",
-              "value": "1"
+              "value": "1",
+              "description": "Write own"
             },
             {
               "type": "open_display",
@@ -63,42 +64,50 @@
               "target": "replace",
               "macros": {
                 "DEV": "${P}KNOB"
-              }
+              },
+              "description": "Default target"
             },
             {
               "type": "open_display",
               "file": "tab.screen.json",
-              "target": "tab"
+              "target": "tab",
+              "description": "Tab"
             },
             {
               "type": "open_display",
               "file": "win.screen.json",
-              "target": "window"
+              "target": "window",
+              "description": "Window"
             },
             {
               "type": "open_display",
               "file": "alone.screen.json",
-              "target": "window"
+              "target": "window",
+              "description": "Standalone"
             },
             {
               "type": "open_display",
               "file": "replace.screen.json",
-              "target": "replace"
+              "target": "replace",
+              "description": "Replace"
             },
             {
               "type": "open_display",
               "file": "odd.screen.json",
-              "target": "replace"
+              "target": "replace",
+              "description": "Odd"
             },
             {
               "type": "open_display",
               "file": "legacy.screen.json",
-              "target": "replace"
+              "target": "replace",
+              "description": "Legacy"
             },
             {
               "type": "open_display",
               "file": "",
-              "target": "replace"
+              "target": "replace",
+              "description": "Empty"
             },
             {
               "type": "execute",
@@ -112,12 +121,15 @@
             },
             {
               "type": "open_webpage",
-              "url": "https://example.org"
+              "url": "https://example.org",
+              "description": "Web"
             },
             {
-              "type": "close_display"
+              "type": "close_display",
+              "description": "Close"
             }
-          ]
+          ],
+          "actionsAsMenu": true
         },
         "geometry": {
           "x": 0,

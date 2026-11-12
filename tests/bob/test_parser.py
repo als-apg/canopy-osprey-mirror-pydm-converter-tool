@@ -285,3 +285,18 @@ def test_malformed_error_is_value_error():
 def test_wrong_root_raises():
     with pytest.raises(BobParseError):
         parse_bob(b"<notadisplay/>")
+
+
+@pytest.mark.parametrize(
+    "attrs, as_one",
+    [("", False), (' execute_as_one="false"', False), (' execute_as_one="true"', True), (' hook_all="true"', True)],
+)
+def test_actions_execute_as_one(attrs, as_one):
+    display = parse_bob(
+        _doc(
+            f'<widget type="action_button"><name>B</name><actions{attrs}>'
+            '<action type="write_pv"><pv_name>A</pv_name><value>1</value></action>'
+            "</actions></widget>"
+        )
+    )
+    assert display.widgets[0].actions_as_one is as_one

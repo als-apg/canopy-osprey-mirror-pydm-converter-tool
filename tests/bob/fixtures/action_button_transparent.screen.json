@@ -36,7 +36,8 @@
             {
               "type": "write_pv",
               "pvName": "SR:GO",
-              "value": "1"
+              "value": "1",
+              "description": "Write own"
             }
           ],
           "transparent": true

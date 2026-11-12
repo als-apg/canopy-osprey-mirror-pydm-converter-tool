@@ -201,7 +201,7 @@ def test_open_file_drops_anything_but_a_path_with_a_warning(path):
 
 def test_close_display_unconditional():
     out, ctx = _lower('<action type="close_display"><description>Close</description></action>')
-    assert out == [{"type": "close_display"}]
+    assert out == [{"type": "close_display", "description": "Close"}]
     assert ctx.warnings == []
 
 

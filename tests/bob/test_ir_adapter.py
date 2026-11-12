@@ -460,19 +460,26 @@ def test_actions_fixture():
     declarer, button = _children("actions")
     assert declarer["props"] == {"pv": "loc://target?type=int&init=3"}
     actions = button["props"]["actions"]
-    assert actions[0] == {"type": "write_pv", "pvName": "loc://target?type=int&init=3", "value": "1"}
+    assert actions[0] == {
+        "type": "write_pv",
+        "pvName": "loc://target?type=int&init=3",
+        "value": "1",
+        "description": "Write own",
+    }
     assert actions[1] == {
         "type": "open_display",
         "file": "../common/KnobPanel.screen.json",
         "target": "replace",
         "macros": {"DEV": "${P}KNOB"},
+        "description": "Default target",
     }
     assert [a.get("target") for a in actions[2:7]] == ["tab", "window", "window", "replace", "replace"]
     assert [a for a in actions if a["type"] == "execute"] == [
         {"type": "execute", "command": "xterm -e caget SR:A", "description": "Shell"},
         {"type": "execute", "command": "ls", "description": "Shell 2"},
     ]
-    assert actions[-1] == {"type": "close_display"}
+    assert actions[-1] == {"type": "close_display", "description": "Close"}
+    assert button["props"]["actionsAsMenu"] is True
     assert not any(a["type"] == "execute" and "print" in a.get("command", "") for a in actions)
     warnings = button["warnings"]
     assert (
@@ -641,3 +648,36 @@ def test_file_rule_with_a_value_that_is_not_a_path_is_dropped(value):
     )
     assert node.get("rules", []) == []
     assert f"W: rule 'img' value {value!r} is not a file path; dropped" in node["warnings"]
+
+
+_ON_OFF = (
+    '<action type="write_pv"><description>ON</description><pv_name>X:HV_ON:SP</pv_name><value>1</value></action>'
+    '<action type="write_pv"><description>OFF</description><pv_name>X:HV_ON:SP</pv_name><value>0</value></action>'
+)
+
+
+@pytest.mark.parametrize(
+    "actions_open, menu",
+    [
+        ("<actions>", True),  # the Phoebus default: a menu of the two writes
+        ('<actions execute_as_one="true">', False),  # one click runs both, in order
+        ('<actions hook_all="true">', False),  # the BOY spelling
+    ],
+)
+def test_action_button_with_several_actions_is_a_menu_unless_executed_as_one(actions_open, menu):
+    button = _one_widget(
+        f'<widget type="action_button"><name>HV</name><text>HV ON/OFF</text>{actions_open}{_ON_OFF}</actions></widget>'
+    )
+    assert button["type"] == "regular-button"
+    assert button["props"].get("actionsAsMenu", False) is menu
+    assert [(a["value"], a["description"]) for a in button["props"]["actions"]] == [("1", "ON"), ("0", "OFF")]
+
+
+def test_action_button_with_one_action_runs_it():
+    button = _one_widget(
+        '<widget type="action_button"><name>Go</name><actions>'
+        '<action type="write_pv"><pv_name>X:GO</pv_name><value>1</value></action>'
+        "</actions></widget>"
+    )
+    assert "actionsAsMenu" not in button["props"]
+    assert "description" not in button["props"]["actions"][0]
